@@ -1,0 +1,89 @@
+name: Monitor Entradas Foo Fighters (Sivori Media)
+
+on:
+  # Ejecución periódica automática en la nube (cada 5 minutos, el mínimo permitido por GitHub Actions)
+  schedule:
+    - cron: "*/5 * * * *"
+  # Permite ejecutarlo manualmente con un clic desde la pestaña "Actions" en GitHub
+  workflow_dispatch:
+    inputs:
+      test_notify:
+        description: "Enviar notificación de prueba a Telegram/Discord/Email (simula entradas disponibles)"
+        required: false
+        default: false
+        type: boolean
+      section:
+        description: "Sector a monitorear en AllAccess"
+        required: false
+        default: "Sivori media"
+        type: string
+
+concurrency:
+  group: allaccess-foo-fighters-monitor
+  cancel-in-progress: false
+
+jobs:
+  check-tickets:
+    name: Chequear Sívori Media en AllAccess
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Descargar código del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Restaurar estado de alertas (Anti-Spam / Cooldown)
+        if: ${{ inputs.test_notify != true }}
+        uses: actions/cache/restore@v4
+        with:
+          path: .monitor_state.json
+          key: allaccess-ff-state-${{ github.run_id }}
+          restore-keys: |
+            allaccess-ff-state-
+
+      - name: Ejecutar chequeo de entradas en AllAccess
+        env:
+          ALLACCESS_EVENT_URL: "https://www.allaccess.com.ar/event/foo-fighters"
+          ALLACCESS_TARGET_SECTION: ${{ inputs.section || 'Sivori media' }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          TZ: "America/Argentina/Buenos_Aires"
+        run: |
+          if [ "${{ inputs.test_notify }}" = "true" ]; then
+            echo "🧪 Ejecutando prueba de notificación (simulando entradas disponibles)..."
+            python -m allaccess_monitor --once --mock-status available --state-file /tmp/test_state.json
+          else
+            set +e
+            python -m allaccess_monitor --once --state-file .monitor_state.json
+            exit_code=$?
+            set -e
+            # Exit code 0 = Entradas disponibles, Exit code 2 = Agotado / Sin stock (normal)
+            if [ $exit_code -eq 0 ] || [ $exit_code -eq 2 ]; then
+              exit 0
+            else
+              exit $exit_code
+            fi
+          fi
+
+      - name: Guardar estado de alertas actualizado (Anti-Spam / Cooldown)
+        if: always() && inputs.test_notify != true
+        uses: actions/cache/save@v4
+        with:
+          path: .monitor_state.json
+          key: allaccess-ff-state-${{ github.run_id }}

@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="es">
+<head>
+    <meta charset="utf-8">
+    <title>Foo Fighters - AllAccess</title>
+</head>
+<body>
+    <div id="app">
+        <div class="event-header">
+            <h1>Foo Fighters</h1>
+        </div>
+        <div id="page-captcha" class="loader_process" style="display:none">
+            <div>Disculpa, detectamos actividad sospechosa</div>
+            <div id="request-captcha-container"></div>
+        </div>
+    </div>
+    <script>
+        (function() {
+            window.App = window.App || {};
+            App.bootstrapData({
+                "model": {
+                    "summary": {
+                        "model": "event",
+                        "id": 18337
+                    },
+                    "data": {
+                        "id": 18337,
+                        "name": "Foo Fighters",
+                        "slug": "foo-fighters",
+                        "onSale": true,
+                        "salesStatus": "IN_SALE",
+                        "shows": [
+                            {
+                                "id": 239575,
+                                "name": "25/02/2027 20:00",
+                                "date": "2027-02-25T23:00:00Z",
+                                "available": true,
+                                "sectionAvailability": [
+                                    {
+                                        "id": 360261,
+                                        "name": "Sivori Media",
+                                        "uuid": "509aabf4-24be-4c44-a86f-de570742c1e4",
+                                        "available": false,
+                                        "lowAvailability": false
+                                    }
+                                ],
+                                "sectors": [
+                                    {
+                                        "id": 689304,
+                                        "name": "Sivori Media",
+                                        "available": true,
+                                        "rates": [
+                                            {
+                                                "id": 4486883,
+                                                "name": "Sivori Media",
+                                                "price": 125000,
+                                                "serviceChargeAmount": 18750,
+                                                "availability": 0,
+                                                "available": false,
+                                                "max": 0,
+                                                "pickerPrice": "125000.00"
+                                            }
+                                        ],
+                                        "sections": [
+                                            {
+                                                "id": 360261,
+                                                "name": "Sivori Media",
+                                                "available": false,
+                                                "lowAvailability": false
+                                            }
+                                        ]
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }
+            });
+            App.start();
+        })();
+    </script>
+</body>
+</html>

@@ -1,0 +1,32 @@
+# Entornos virtuales
+.venv/
+venv/
+ENV/
+env/
+
+# Byte-compiled / optimizados
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Variables de entorno y secretos (NUNCA subir a GitHub)
+.env
+.env.local
+
+# Archivo de estado local y logs
+.monitor_state.json
+*.log
+
+# Caché de tests
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDEs y editores
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Artefactos internos de agentes
+.agents/

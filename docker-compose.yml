@@ -1,0 +1,12 @@
+services:
+  allaccess-monitor:
+    build: .
+    container_name: allaccess-foo-fighters-monitor
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - monitor_data:/app/data
+
+volumes:
+  monitor_data:

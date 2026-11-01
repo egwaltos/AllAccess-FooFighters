@@ -1,0 +1,22 @@
+services:
+  - type: worker
+    name: allaccess-foo-fighters-monitor
+    runtime: docker
+    plan: starter
+    envVars:
+      - key: ALLACCESS_EVENT_URL
+        value: "https://www.allaccess.com.ar/event/foo-fighters"
+      - key: ALLACCESS_TARGET_SECTION
+        value: "Sivori media"
+      - key: POLL_INTERVAL_SECONDS
+        value: "60"
+      - key: ALERT_COOLDOWN_SECONDS
+        value: "1800"
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: DISCORD_WEBHOOK_URL
+        sync: false
+      - key: TZ
+        value: "America/Argentina/Buenos_Aires"
