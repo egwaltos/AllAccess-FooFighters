@@ -69,12 +69,12 @@ class MonitorWebService:
                 self.config.target_section,
                 self.config.check_interval_seconds,
             )
-            while not self.scheduler._stop_event.is_set():
+            while not self.scheduler.is_stopped:
                 try:
                     self.run_check(min_interval_seconds=5.0)
                 except Exception as exc:
                     logger.exception("Error in background check cycle: %s", exc)
-                self.scheduler._stop_event.wait(self.config.check_interval_seconds)
+                self.scheduler._shutdown.wait(self.config.check_interval_seconds)
 
         self._bg_thread = threading.Thread(target=_run, name="allaccess-poller", daemon=True)
         self._bg_thread.start()
@@ -104,8 +104,8 @@ class MonitorWebService:
             event_url=self.config.event_url,
         )
         result = mock_checker.check_availability(self.config.target_section)
-        payload = self.scheduler._build_alert_payload(result)
-        return self.notifier.send_alert(payload)
+        alert = result.to_alert(is_reminder=False)
+        return self.notifier.send(alert)
 
 
 def create_handler(service: MonitorWebService):
