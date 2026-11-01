@@ -1,8 +1,9 @@
 services:
-  - type: worker
+  - type: web
     name: allaccess-foo-fighters-monitor
     runtime: docker
-    plan: starter
+    plan: free
+    healthCheckPath: /health
     envVars:
       - key: ALLACCESS_EVENT_URL
         value: "https://www.allaccess.com.ar/event/foo-fighters"

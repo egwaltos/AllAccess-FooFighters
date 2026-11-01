@@ -26,5 +26,12 @@ USER appuser
 
 ENV STATE_FILE_PATH=/app/data/.monitor_state.json
 
-# Ejecutar el demonio de monitoreo continuo
-CMD ["python", "-m", "allaccess_monitor"]
+# Puerto expuesto para Render / Railway / Fly.io y cron-job.org
+EXPOSE 8000
+
+# Healthcheck nativo del contenedor
+HEALTHCHECK --interval=60s --timeout=10s --start-period=10s --retries=3 \
+    CMD python -c "import os, urllib.request; port = os.getenv('PORT', '8000'); urllib.request.urlopen(f'http://127.0.0.1:{port}/health', timeout=5)" || exit 1
+
+# Ejecutar servidor HTTP ligero + demonio de monitoreo en segundo plano
+CMD ["python", "-m", "allaccess_monitor.server"]
