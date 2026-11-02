@@ -107,12 +107,14 @@ class PollingScheduler:
         config: Optional[Any] = None,
         targets: Optional[List[Any]] = None,
         alert_burst_delay: float = 0.0,
+        reservation_engine: Optional[Any] = None,
         **kwargs: Any,
     ) -> None:
         self.checker = checker
         self.state_manager = state_manager or AlertStateManager()
         self.notifier = notifier
         self.config = config
+        self.reservation_engine = reservation_engine
         self.alert_burst_delay = max(0.0, float(alert_burst_delay if alert_burst_delay is not None else kwargs.get("alert_burst_delay", 0.0)))
 
         # Resolve interval_seconds with kwargs aliases and config
@@ -437,6 +439,18 @@ class PollingScheduler:
                                 )
                         except Exception as exc:
                             logger.error("Notifier raised unhandled exception during send: %s", exc, exc_info=True)
+
+                    # Optional automatic cart reservation hook (runs after alert is sent)
+                    if self.reservation_engine is not None and result.status == AvailabilityStatus.AVAILABLE:
+                        try:
+                            self.reservation_engine.reserve_for_target(target, result)
+                        except Exception as exc:
+                            logger.error(
+                                "Auto-reservation hook failed for '%s': %s",
+                                target.target_section,
+                                exc,
+                                exc_info=True,
+                            )
 
             # Prioritize AVAILABLE status for primary result
             if primary_result is None:

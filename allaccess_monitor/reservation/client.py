@@ -152,13 +152,27 @@ class AllAccessCartClient(BaseCartClient):
 
         # 3. Inject Request-Specific Headers / Cookies
         req_headers = dict(self.headers)
+        req_headers["Origin"] = self.base_url
+        req_headers["Referer"] = request.event_url or f"{self.base_url}/event/foo-fighters"
         if request.user_token:
-            if request.user_token.startswith("ey") or " " in request.user_token:
-                req_headers["Authorization"] = f"Bearer {request.user_token}"
+            tok = request.user_token.strip()
+            if tok.lower().startswith("bearer "):
+                req_headers["Authorization"] = tok
+            elif tok.startswith("ey") and "." in tok and ";" not in tok and "=" not in tok:
+                req_headers["Authorization"] = f"Bearer {tok}"
+            elif "=" in tok and (";" in tok or tok.startswith("_cid=") or tok.startswith("connect.sid=")):
+                for part in tok.split(";"):
+                    part = part.strip()
+                    if "=" in part:
+                        ck_name, ck_val = part.split("=", 1)
+                        self.session.cookies.set(ck_name.strip(), ck_val.strip())
             else:
-                self.session.cookies.set("connect.sid", request.user_token)
+                # Raw cookie value: set both connect.sid and _cid for Crowder/AllAccess compatibility
+                self.session.cookies.set("connect.sid", tok)
+                self.session.cookies.set("_cid", tok)
         if request.session_id:
             self.session.cookies.set("connect.sid", request.session_id)
+            self.session.cookies.set("_cid", request.session_id)
         if request.csrf_token:
             req_headers["X-CSRF-Token"] = request.csrf_token
 

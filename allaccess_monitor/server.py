@@ -24,7 +24,10 @@ from allaccess_monitor.checker.allaccess import AllAccessTicketChecker
 from allaccess_monitor.checker.mock import MockTicketChecker
 from allaccess_monitor.config import MonitorConfig, load_config
 from allaccess_monitor.logging_setup import setup_logging
-from allaccess_monitor.models import CheckResult
+from allaccess_monitor.models import CheckResult, MonitoredTarget
+from allaccess_monitor.reservation.client import AllAccessCartClient
+from allaccess_monitor.reservation.engine import ReservationEngine, ReservationEngineConfig
+from allaccess_monitor.reservation.mock_service import MockCartClient
 from allaccess_monitor.scheduler import PollingScheduler
 from allaccess_monitor.state import AlertStateManager
 
@@ -47,6 +50,34 @@ class MonitorWebService:
             cooldown_seconds=config.cooldown_seconds,
             state_file=state_path,
         )
+
+        # Auto-Reserve Session Cookie / Token Hook
+        self.user_token = (
+            os.getenv("ALLACCESS_USER_TOKEN")
+            or os.getenv("ALLACCESS_SESSION_COOKIE")
+            or ""
+        ).strip()
+        raw_qty = os.getenv("AUTO_RESERVE_QUANTITY", "2").strip()
+        self.reserve_quantity = min(max(1, int(raw_qty) if raw_qty.isdigit() else 2), 4)
+
+        self.reservation_engine: Optional[ReservationEngine] = None
+        if self.user_token:
+            cart_client = AllAccessCartClient(timeout=config.request_timeout_seconds)
+            res_cfg = ReservationEngineConfig(
+                max_hold_quantity=self.reserve_quantity,
+                user_token=self.user_token,
+                notify_on_reservation=True,
+            )
+            self.reservation_engine = ReservationEngine(
+                client=cart_client,
+                config=res_cfg,
+                notifier=self.notifier,
+            )
+            logger.info(
+                "Auto-reserve hook ENABLED (quantity=%d, session cookie configured)",
+                self.reserve_quantity,
+            )
+
         self.scheduler = PollingScheduler(
             checker=self.checker,
             state_manager=self.state_manager,
@@ -54,6 +85,7 @@ class MonitorWebService:
             interval_seconds=config.check_interval_seconds,
             section_name=config.target_section,
             config=config,
+            reservation_engine=self.reservation_engine,
         )
         self._lock = threading.Lock()
         self.last_result: Optional[CheckResult] = None
@@ -106,6 +138,37 @@ class MonitorWebService:
         result = mock_checker.check_availability(self.config.target_section)
         alert = result.to_alert(is_reminder=False)
         return self.notifier.send(alert)
+
+    def run_test_reserve(self) -> dict:
+        """Simulate a safe cart hold and dispatch the human-in-the-loop reservation alert."""
+        mock_checker = MockTicketChecker(
+            status="available",
+            section_name=self.config.target_section,
+            event_url=self.config.event_url,
+        )
+        result = mock_checker.check_availability(self.config.target_section)
+        mock_cart_client = MockCartClient(scenario="success")
+        res_cfg = ReservationEngineConfig(
+            max_hold_quantity=self.reserve_quantity,
+            user_token=self.user_token or "simulated_session_cookie",
+            notify_on_reservation=True,
+        )
+        test_engine = ReservationEngine(
+            client=mock_cart_client,
+            config=res_cfg,
+            notifier=self.notifier,
+        )
+        target = MonitoredTarget(
+            event_url=self.config.event_url,
+            target_section=self.config.target_section,
+        )
+        reservation = test_engine.reserve_for_target(target, result)
+        return {
+            "status": "ok" if (reservation and reservation.is_active) else "error",
+            "cart_id": reservation.cart_id if reservation else None,
+            "checkout_url": reservation.checkout_url if reservation else None,
+            "hold_seconds": reservation.seconds_remaining if reservation else 0,
+        }
 
 
 def create_handler(service: MonitorWebService):
@@ -170,7 +233,7 @@ def create_handler(service: MonitorWebService):
                     200,
                     {
                         "status": "ok",
-                        "version": "2.0.0",
+                        "version": "2.1.0",
                         "section": service.config.target_section,
                         "targets_count": len(service.config.targets),
                         "interval_seconds": service.config.check_interval_seconds,
@@ -182,6 +245,11 @@ def create_handler(service: MonitorWebService):
                             if service.last_check_epoch > 0
                             else None
                         ),
+                        "auto_reserve": {
+                            "enabled": bool(service.user_token),
+                            "quantity": service.reserve_quantity,
+                            "active_holds": len(service.reservation_engine.active_holds) if service.reservation_engine else 0,
+                        },
                         "channels": {
                             "telegram": service.config.telegram.enabled,
                             "discord": service.config.discord.enabled,
@@ -197,6 +265,15 @@ def create_handler(service: MonitorWebService):
                 self._send_json(
                     200 if sent else 500,
                     {"status": "ok" if sent else "error", "alert_sent": sent},
+                    head_only=head_only,
+                )
+                return
+
+            if path == "/test-reserve":
+                res_info = service.run_test_reserve()
+                self._send_json(
+                    200 if res_info.get("status") == "ok" else 500,
+                    res_info,
                     head_only=head_only,
                 )
                 return
