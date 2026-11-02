@@ -27,7 +27,10 @@ from allaccess_monitor.logging_setup import setup_logging
 from allaccess_monitor.models import CheckResult, MonitoredTarget
 from allaccess_monitor.reservation.client import AllAccessCartClient
 from allaccess_monitor.reservation.engine import ReservationEngine, ReservationEngineConfig
-from allaccess_monitor.reservation.mock_service import MockCartClient
+from allaccess_monitor.reservation.mock_service import (
+    MockAllAccessCheckoutService,
+    MockCheckoutHTTPAdapter,
+)
 from allaccess_monitor.scheduler import PollingScheduler
 from allaccess_monitor.state import AlertStateManager
 
@@ -141,13 +144,18 @@ class MonitorWebService:
 
     def run_test_reserve(self) -> dict:
         """Simulate a safe cart hold and dispatch the human-in-the-loop reservation alert."""
+        import requests as _requests
         mock_checker = MockTicketChecker(
             status="available",
             section_name=self.config.target_section,
             event_url=self.config.event_url,
         )
         result = mock_checker.check_availability(self.config.target_section)
-        mock_cart_client = MockCartClient(scenario="success")
+        mock_svc = MockAllAccessCheckoutService(sector_name=self.config.target_section)
+        mock_session = _requests.Session()
+        mock_session.mount("https://", MockCheckoutHTTPAdapter(mock_svc))
+        mock_session.mount("http://", MockCheckoutHTTPAdapter(mock_svc))
+        mock_cart_client = AllAccessCartClient(session=mock_session)
         res_cfg = ReservationEngineConfig(
             max_hold_quantity=self.reserve_quantity,
             user_token=self.user_token or "simulated_session_cookie",
