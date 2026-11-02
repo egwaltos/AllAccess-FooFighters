@@ -136,6 +136,13 @@ def create_handler(service: MonitorWebService):
             path = parsed.path.rstrip("/") or "/"
 
             if path in ("/", "/health"):
+                # If last check was >25s ago, trigger an async check without blocking the health response
+                if (time.time() - service.last_check_epoch) >= 25.0:
+                    threading.Thread(
+                        target=service.run_check,
+                        kwargs={"min_interval_seconds": 20.0},
+                        daemon=True,
+                    ).start()
                 # Ultra-compact response (<70 bytes) for cron-job.org & Render health checks
                 self._send_json(
                     200,
@@ -163,7 +170,9 @@ def create_handler(service: MonitorWebService):
                     200,
                     {
                         "status": "ok",
+                        "version": "2.0.0",
                         "section": service.config.target_section,
+                        "targets_count": len(service.config.targets),
                         "interval_seconds": service.config.check_interval_seconds,
                         "total_checks": service.total_checks,
                         "last_status": last.status.value if last else None,
