@@ -33,6 +33,7 @@ from allaccess_monitor.reservation.mock_service import (
 )
 from allaccess_monitor.scheduler import PollingScheduler
 from allaccess_monitor.state import AlertStateManager
+from allaccess_monitor.telegram_bot import TelegramCommandBot
 
 logger = logging.getLogger("allaccess_monitor.server")
 
@@ -95,9 +96,11 @@ class MonitorWebService:
         self.last_check_epoch: float = 0.0
         self.total_checks: int = 0
         self._bg_thread: Optional[threading.Thread] = None
+        self.telegram_bot = TelegramCommandBot(self)
 
     def start_background_loop(self) -> None:
-        """Start the continuous background polling loop in a daemon thread."""
+        """Start the continuous background polling loop and Telegram bot listener."""
+        self.telegram_bot.start()
         def _run() -> None:
             logger.info(
                 "Background polling loop started for '%s' every %ds",
