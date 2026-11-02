@@ -12,6 +12,7 @@ Provides real-time (<0.5s) long-polling command & inline button handling:
 """
 from datetime import datetime, timezone
 import html
+import json
 import logging
 import threading
 import time
@@ -19,7 +20,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from allaccess_monitor.checker.allaccess import DEFAULT_BROWSER_HEADERS, extract_bootstrap_json
+from allaccess_monitor.checker.allaccess import DEFAULT_BROWSER_HEADERS
 from allaccess_monitor.models import AvailabilityStatus, MonitoredTarget
 
 logger = logging.getLogger("allaccess_monitor.telegram_bot")
@@ -323,7 +324,12 @@ class TelegramCommandBot:
         url = self.service.config.event_url
         try:
             resp = requests.get(url, headers=DEFAULT_BROWSER_HEADERS, timeout=15)
-            data = extract_bootstrap_json(resp.text)
+            marker = "App.bootstrapData("
+            idx = resp.text.find(marker)
+            if idx == -1:
+                self._send_message(chat_id, "⚠️ No se pudo leer la grilla de sectores de AllAccess.")
+                return
+            data, _ = json.JSONDecoder().raw_decode(resp.text[idx + len(marker):])
             event_data = ((data or {}).get("model") or {}).get("data") or {}
             event_name = event_data.get("name") or "Foo Fighters"
             shows = event_data.get("shows") or []
