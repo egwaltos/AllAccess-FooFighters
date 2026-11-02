@@ -1,201 +1,173 @@
-# Project: AllAccess Foo Fighters Ticket Monitor
+# Project: AllAccess Ticket Alert & Reservation System Enhancement
 
 ## Architecture
-The application is a Python-based continuous monitoring daemon with modular components designed for high reliability, zero false positives, sub-millisecond signal responsiveness, and multi-channel alerting.
+
+The system extends `allaccess_monitor` to support multi-event and multi-sector monitoring, rich multi-channel alerts with per-target cooldown deduplication, and a safe, non-transactional ticket reservation prototype.
 
 ```
-                      ┌──────────────────┐
-                      │     User CLI     │ (python -m allaccess_monitor)
-                      └────────┬─────────┘
-                               │
-                      ┌────────▼─────────┐
-                      │      cli.py      │ (argparse, loads .env, builds config)
-                      └────────┬─────────┘
-                               │
-                      ┌────────▼─────────┐
-                      │ PollingScheduler │
-                      └────────┬─────────┘
-                               │
-       ┌───────────────────────┴───────────────────────┐
-       │ Tick Execution                                │
-       ▼                                               ▼
- ┌───────────────────────┐                   ┌───────────────────┐
- │     TicketChecker     │                   │  GracefulShutdown │
- │ (AllAccess / Mock)    │                   │ (threading.Event) │
- └──────────┬────────────┘                   └───────────────────┘
-            │ returns CheckResult
-            ▼
- ┌───────────────────────┐
- │   AlertStateManager   │
- │ (Edge & Cooldown)     │
- └──────────┬────────────┘
-            │ should_alert == True?
-            ├──────────────────────────────┐
-            │ Yes                          │ No
-            ▼                              ▼
- ┌───────────────────────┐         ┌───────────────────────────────┐
- │   CompositeNotifier   │         │ Log status & wait next cycle  │
- │ (Telegram/Discord/    │         │ (Standard interval or backoff)│
- │  Email/Console)       │         └───────────────────────────────┘
- └───────────────────────┘
+                           ┌─────────────────────────────────────────┐
+                           │          Configuration Source           │
+                           │  - Legacy env vars (single event)       │
+                           │  - Comma-separated sectors              │
+                           │  - Static events config (JSON / file)   │
+                           └────────────────────┬────────────────────┘
+                                                │
+                                                ▼
+                           ┌─────────────────────────────────────────┐
+                           │              MonitorConfig              │
+                           │  - targets: List[MonitoredTarget]       │
+                           │  - backward-compatible single properties │
+                           └────────────────────┬────────────────────┘
+                                                │
+                                                ▼
+                           ┌─────────────────────────────────────────┐
+                           │            PollingScheduler             │
+                           │  - Cycles through monitored targets     │
+                           │  - Groups checks by event URL for batch │
+                           │  - Exponential backoff & jitter         │
+                           └────────┬──────────────────────┬─────────┘
+                                    │                      │
+                                    ▼                      ▼
+                     ┌──────────────────────┐      ┌─────────────────────────────┐
+                     │ AllAccessTicketChecker│      │      AlertStateManager      │
+                     │ - App.bootstrapData  │      │ - Partitioned by target     │
+                     │ - Multi-sector parse │      │ - Independent cooldown      │
+                     │ - Session/date info  │      │ - State-change edge trigger │
+                     └──────────────────────┘      └──────────────┬──────────────┘
+                                                                  │
+                                                                  ▼
+                                                   ┌─────────────────────────────┐
+                                                   │      CompositeNotifier      │
+                                                   │ - Telegram, Discord, Email  │
+                                                   │ - Event, date/session,      │
+                                                   │   sector, price, checkout   │
+                                                   └──────────────┬──────────────┘
+                                                                  │ (Optional auto-reserve)
+                                                                  ▼
+                                                   ┌─────────────────────────────┐
+                                                   │   ReservationEngine &       │
+                                                   │   MockCheckoutService       │
+                                                   │ - Non-transactional hold    │
+                                                   │ - Budget & quantity guards  │
+                                                   │ - Safe human-in-loop link   │
+                                                   └─────────────────────────────┘
 ```
 
 ## Feature Inventory
+
 | # | Feature | Description | Milestone | Source |
 |---|---------|-------------|-----------|--------|
-| 1 | F1: Bootstrap Extraction | Extract inline `App.bootstrapData` JSON from AllAccess HTML page without fragile full-page regex | M1 | Survey Explorer 1 |
-| 2 | F2: Unicode & Accent Normalization | NFKD normalization matching "Sivori media" against "Sivori Media", "Sívori media", etc. | M1 | Survey Explorer 1 |
-| 3 | F3: Availability & False-Positive Filter | Strict check: both rate availability (`available: True`, `max > 0`) and section availability (`available: True`), rejecting deceptive sector-level `available: True` flags | M1 | Survey Explorer 1 |
-| 4 | F4: Pricing Extraction | Parse ticket price and service charge from sector rate information | M1 | Survey Explorer 1 |
-| 5 | F5: WAF & Challenge Detection | Detect AWS WAF / Captcha blocks (`request-captcha-container`) and raise distinct exceptions | M1 | Survey Explorer 1 |
-| 6 | F6: Telegram Notifier | Deliver alerts via Telegram Bot API with HTML parse mode and link to purchase | M2 | Survey Explorer 2 |
-| 7 | F7: Discord Notifier | Deliver alerts via Discord Webhook with rich embeds and status fields | M2 | Survey Explorer 2 |
-| 8 | F8: Email Notifier | Deliver alerts via SMTP (STARTTLS port 587 and SSL port 465) with multipart HTML + text | M2 | Survey Explorer 2 |
-| 9 | F9: Composite Multiplexer | Multiplex alerts across all enabled channels with per-channel error isolation | M2 | Survey Explorer 2 |
-| 10 | F10: State Machine & Cooldown Throttling | Immediate alert on `UNAVAILABLE -> AVAILABLE`, suppress duplicates during cooldown, reset on `UNAVAILABLE` | M2 | Survey Explorer 2 |
-| 11 | F11: Configuration & Secret Masking | Cascading config (CLI > .env > defaults) with automatic credential redaction in `__repr__` and logs | M1 | Survey Explorer 2 & 3 |
-| 12 | F12: Responsive Polling Scheduler | Main loop using `threading.Event().wait()` for sub-millisecond graceful shutdown on Windows & POSIX | M3 | Survey Explorer 3 |
-| 13 | F13: Exponential Backoff & Jitter | Exponential backoff with full jitter and `Retry-After` header parsing on HTTP 429/5xx | M3 | Survey Explorer 3 |
-| 14 | F14: CLI Interface & Daemon Flags | `argparse` CLI with `--interval`, `--section`, `--url`, `--once`, `--dry-run`, `--mock-status` | M3 | Survey Explorer 3 |
-| 15 | F15: Mock & Simulation Fixtures | 5 canonical test fixtures (`AVAILABLE`, `UNAVAILABLE`, `SECTION_MISSING`, `NETWORK_ERROR`, `MALFORMED`) | M3 | Survey Explorer 3 |
+| F1 | `MonitoredTarget` model | Structured dataclass representing an event + target sector | M1 | Survey 1 |
+| F2 | Backward-compatible Config | Support legacy single-event env vars while parsing multi-target JSON/comma-separated configs | M1 | Survey 1 |
+| F3 | Multi-sector HTML parsing | Parse multiple sectors and session date/time from a single `App.bootstrapData` page | M1 | Survey 1/2 |
+| F4 | Target-partitioned State Tracking | Partition `AlertStateManager` tracking by `(event_url, sector)` to prevent state flapping | M1 | Survey 2 |
+| F5 | Multi-target polling cycle | Update `PollingScheduler` to check all targets in cycle and handle independent availability | M1 | Survey 1 |
+| F6 | Rich Notification Models | Enrich `TicketAlert` with session date/time and direct checkout URL | M2 | Survey 2 |
+| F7 | Telegram Notifier formatting | Render event, date/session, sector, price, direct link, and timestamp in Telegram | M2 | Survey 2 |
+| F8 | Discord Notifier formatting | Render rich embed with session date, sector, price, direct link, and timestamp in Discord | M2 | Survey 2 |
+| F9 | Email Notifier formatting | Render plain text & HTML with complete event, session date, sector, price, direct link | M2 | Survey 2 |
+| F10 | Console Notifier formatting | Render clean formatted banners with session date, sector, status, and direct link | M2 | Survey 2 |
+| F11 | Configurable Cooldown & Deduplication | Enforce per-target cooldown timer and instant state-change alert triggers | M2 | Survey 2 |
+| F12 | Technical Feasibility Report | Document checkout API endpoints, session flow, Crowder backend, and anti-bot limitations | M3 | Survey 3 |
+| F13 | Safe Reservation Domain Models | Models for `CartReservation`, `ReservationRequest`, `ReservationStatus`, `CartItem` | M3 | Survey 3 |
+| F14 | Safe Carting Client & Engine | `AllAccessCartClient` & `ReservationEngine` with quantity/budget limits and no payments | M3 | Survey 3 |
+| F15 | Mock Checkout Service | Deterministic in-memory mock simulating Crowder hold, timeout, 409 sold out, 429 rate limit | M3 | Survey 3 |
+| F16 | Standalone Reservation CLI Script | Executable demonstration script/module for safe ticket carting and hold acquisition | M3 | Survey 3 |
+| F17 | Pytest Framework Setup | Add `pytest>=8.0.0` dependency, `pytest.ini` configuration, verify full suite executes | M4 | Survey 3 |
+| F18 | Comprehensive Unit & Integration Tests | Unit & integration tests for multi-target config, parsing, state, alerts, and carting | M4 | Survey 1/2/3 |
+| F19 | E2E Testing Suite & Regression Verification | Opaque-box regression check ensuring 486 existing tests + new test tiers pass cleanly | M4 | Survey 1/2/3 |
 
 ## Milestones
+
 | # | Name | Scope | Dependencies | Status |
 |---|------|-------|-------------|--------|
-| 1 | M1: Core Domain, Config & Ticket Checker | `models.py`, `config.py`, `logging_setup.py`, `checker/base.py`, `checker/allaccess.py`, `checker/mock.py`, parser & checker unit tests | none | DONE |
-| 2 | M2: Notifiers & State Throttler | `notifier/base.py`, `notifier/telegram.py`, `notifier/discord.py`, `notifier/email.py`, `notifier/console.py`, `notifier/composite.py`, `state.py`, notifier & state unit tests | M1 | DONE |
-| 3 | M3: Polling Scheduler, CLI Daemon & Fixtures | `scheduler.py`, `cli.py`, `__main__.py`, `__init__.py`, `.env.example`, `README.md`, 5 test fixtures, scheduler & CLI unit tests | M1, M2 | PLANNED |
-| 4 | M4: Final Milestone (E2E Pass & Adversarial Hardening) | Phase 1: 100% pass of E2E test suite (Tiers 1-4). Phase 2: Adversarial coverage hardening (Tier 5) | M3, E2E Track | PLANNED |
+| M1 | Multi-Event & Multi-Sector Monitoring | F1, F2, F3, F4, F5: `MonitoredTarget`, `MonitorConfig` parsing, multi-sector extraction, partitioned `AlertStateManager`, scheduler loop | none | DONE (554 tests pass) |
+| M3 | Purchasing Feasibility Report & Reservation Prototype | F12, F13, F14, F15, F16: Feasibility report markdown, reservation models, cart client, reservation engine, mock checkout service, CLI runner | none | DONE (640+ tests pass) |
+| M4 | Comprehensive Test Suite & Pytest Verification | F17, F18, F19: `pytest` installation and configuration, unit/integration tests for M1-M3, full suite execution passing 100% | M1, M2, M3 | DONE (681 tests pass under pytest & unittest) |
 
 ## Interface Contracts
 
-### Domain Models (`models.py`)
+### 1. `MonitoredTarget` & `CheckResult`
 ```python
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from enum import Enum
-from typing import Optional, Dict, Any
-
-class AvailabilityStatus(Enum):
-    AVAILABLE = "AVAILABLE"
-    UNAVAILABLE = "UNAVAILABLE"
-    SECTION_NOT_FOUND = "SECTION_NOT_FOUND"
-    ERROR = "ERROR"
-
 @dataclass(frozen=True)
-class SectionInfo:
-    name: str
-    available: bool
-    price: Optional[float] = None
-    currency: str = "ARS"
-    service_charge: Optional[float] = None
-    raw_data: Optional[Dict[str, Any]] = None
+class MonitoredTarget:
+    event_url: str
+    target_section: str
+    event_name: Optional[str] = None
+    max_price: Optional[float] = None
 
 @dataclass(frozen=True)
 class CheckResult:
     status: AvailabilityStatus
-    section_name: str
-    section_info: Optional[SectionInfo] = None
     event_name: str = "Foo Fighters"
     event_url: str = "https://www.allaccess.com.ar/event/foo-fighters"
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    error_message: Optional[str] = None
+    section: Optional[SectionInfo] = None
+    all_sections: List[SectionInfo] = field(default_factory=list)
     status_code: Optional[int] = None
+    error_message: Optional[str] = None
+    response_time_ms: float = 0.0
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    session_name: Optional[str] = None
+    session_date: Optional[str] = None
+    direct_checkout_url: Optional[str] = None
+```
 
+### 2. `TicketAlert`
+```python
 @dataclass(frozen=True)
 class TicketAlert:
     event_name: str
     section_name: str
-    status: str                         # "AVAILABLE" | "REMINDER"
+    status: str
     event_url: str
     price: Optional[float] = None
     currency: str = "ARS"
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     is_reminder: bool = False
+    session_name: Optional[str] = None
+    session_date: Optional[str] = None
+    direct_checkout_url: Optional[str] = None
 ```
 
-### Checker Interface (`checker/base.py`)
+### 3. `AlertStateManager` Multi-Target State Contract
 ```python
-from abc import ABC, abstractmethod
-from allaccess_monitor.models import CheckResult
-
-class BaseTicketChecker(ABC):
-    @abstractmethod
-    def check_availability(self, section_name: str) -> CheckResult:
-        """Fetch and evaluate ticket availability for the target section."""
-        pass
-```
-
-### Notifier Interface (`notifier/base.py`)
-```python
-from abc import ABC, abstractmethod
-from allaccess_monitor.models import TicketAlert
-
-class BaseNotifier(ABC):
-    @property
-    @abstractmethod
-    def channel_name(self) -> str:
-        """Identifier name of the notification channel."""
-        pass
-
-    @abstractmethod
-    def send(self, alert: TicketAlert) -> bool:
-        """Deliver alert to channel. Returns True on success, False on failure."""
-        pass
-```
-
-### State Throttler Interface (`state.py`)
-```python
-@dataclass
-class AlertDecision:
-    should_alert: bool
-    is_reminder: bool = False
-    reason: str = ""
-
 class AlertStateManager:
-    def __init__(self, cooldown_seconds: int = 1800, state_file: Optional[Path] = None):
-        ...
-    def process_check_result(self, is_available: bool, current_time: Optional[float] = None) -> AlertDecision:
-        ...
+    def evaluate(self, result: CheckResult) -> AlertDecision: ...
+    # Backward compatibility:
+    @property
+    def is_currently_available(self) -> bool: ...
+    @property
+    def last_alert_time(self) -> Optional[float]: ...
+```
+
+### 4. Reservation Subsystem Contract
+```python
+class BaseCartClient(ABC):
+    @abstractmethod
+    def reserve_tickets(self, request: ReservationRequest) -> CartReservation: ...
+    @abstractmethod
+    def release_cart(self, cart_id: str) -> bool: ...
 ```
 
 ## Code Layout
-```
-allaccess_monitor/
-├── __init__.py               # Package metadata and version definition
-├── __main__.py               # Direct execution entrypoint: python -m allaccess_monitor
-├── cli.py                    # Argument parsing, flag validation, CLI entrypoint
-├── config.py                 # Dataclasses, .env loader, validation, secret masking
-├── models.py                 # Domain models (AvailabilityStatus, SectionInfo, CheckResult, TicketAlert)
-├── checker/
-│   ├── __init__.py
-│   ├── base.py               # Abstract BaseChecker protocol
-│   ├── allaccess.py          # Real HTTP fetcher, Rendr bootstrap extractor, section availability evaluator
-│   └── mock.py               # MockTicketChecker for simulation & test suite
-├── notifier/
-│   ├── __init__.py
-│   ├── base.py               # Abstract BaseNotifier protocol
-│   ├── composite.py          # CompositeNotifier multiplexing to enabled channels
-│   ├── telegram.py           # Telegram Bot API notifier (HTML mode)
-│   ├── discord.py            # Discord Webhook notifier (Rich Embeds)
-│   ├── email.py              # SMTP Email notifier (STARTTLS, MIME text+HTML)
-│   └── console.py            # Console / Dry-run notifier
-├── state.py                  # AlertStateManager: edge detection, cooldown throttling, persistence
-├── scheduler.py              # PollingScheduler: loop, threading.Event, backoff, metrics
-└── logging_setup.py          # Logger configuration, custom credential redaction filter
-tests/
-├── __init__.py
-├── fixtures/
-│   ├── __init__.py
-│   ├── available_response.html
-│   ├── sold_out_response.html
-│   ├── section_missing_response.html
-│   └── malformed_response.html
-├── test_parser.py
-├── test_state.py
-├── test_notifier.py
-├── test_scheduler.py
-└── test_cli.py
-.env.example
-README.md
-```
+
+- `allaccess_monitor/models.py`: Core domain models (`MonitoredTarget`, `SectionInfo`, `CheckResult`, `TicketAlert`).
+- `allaccess_monitor/config.py`: Configuration parsing, `events.json` / env var multi-target loader.
+- `allaccess_monitor/checker/allaccess.py`: Multi-sector parser & session metadata extractor.
+- `allaccess_monitor/state.py`: Partitioned `AlertStateManager`.
+- `allaccess_monitor/scheduler.py`: Multi-target polling scheduler.
+- `allaccess_monitor/notifier/*.py`: Telegram, Discord, Email, Console rich formatters.
+- `allaccess_monitor/reservation/`:
+  - `models.py`: Cart reservation models.
+  - `client.py`: Base and HTTP cart clients.
+  - `engine.py`: Reservation engine with safety budget & quantity limits.
+  - `mock_service.py`: In-memory deterministic mock checkout service.
+- `allaccess_monitor/scripts/reserve_prototype.py` (or `reservation_cli.py`): Executable prototype runner.
+- `docs/purchasing_feasibility_report.md`: Standalone technical feasibility report.
+- `pytest.ini` & `requirements.txt`: Test configuration and pytest package.
+- `tests/`:
+  - `test_multi_target_config.py`: Testing multi-event/multi-sector config and backwards compatibility.
+  - `test_multi_target_state.py`: Testing partitioned state tracking and cooldown isolation.
+  - `test_alert_formatting.py`: Testing rich message generation across all 4 channels.
+  - `test_reservation_prototype.py`: Testing safe carting, budget ceilings, mock checkout responses.
+  - All existing 12 test files maintained with 100% pass rate.

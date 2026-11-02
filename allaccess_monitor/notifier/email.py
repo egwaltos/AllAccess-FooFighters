@@ -16,6 +16,21 @@ from allaccess_monitor.notifier.base import BaseNotifier
 logger = logging.getLogger(__name__)
 
 
+def _format_session_str(alert: TicketAlert) -> Optional[str]:
+    """Format session and date information into a clean display string."""
+    s_name = (alert.session_name or "").strip()
+    s_date = (alert.session_date or "").strip()
+    if s_name and s_date:
+        if s_name == s_date or s_date in s_name:
+            return s_name
+        return f"{s_date} ({s_name})"
+    elif s_name:
+        return s_name
+    elif s_date:
+        return s_date
+    return None
+
+
 class EmailNotifier(BaseNotifier):
     """
     Notification delivery provider for SMTP email.
@@ -89,8 +104,11 @@ class EmailNotifier(BaseNotifier):
             logger.error("Email notifier cannot send alert: to_addrs recipient list is empty.")
             return False
 
+        event_name = str(alert.event_name or "Event")
+        section_name = str(alert.section_name or "Sector")
+
         prefix = "[REMINDER]" if alert.is_reminder else "[ALERT]"
-        subject = f"🚨 {prefix} {alert.event_name} - {alert.section_name} Tickets Available!"
+        subject = f"🚨 {prefix} {event_name} - {section_name} Tickets Available!"
 
         msg = EmailMessage()
         msg["Subject"] = subject
@@ -99,18 +117,44 @@ class EmailNotifier(BaseNotifier):
 
         time_str = alert.timestamp.strftime("%Y-%m-%d %H:%M:%S UTC")
         formatted_price = alert.formatted_price
+        session_str = _format_session_str(alert)
+        purchase_url = (alert.direct_checkout_url or alert.event_url or "").strip()
+        event_url = (alert.event_url or "").strip()
+        has_distinct_checkout = bool(alert.direct_checkout_url and alert.direct_checkout_url.strip() != event_url)
+
+        # Plain Text Body
+        session_line = f"Date/Session: {session_str}\n" if session_str else ""
+        event_page_line = f"Event Page:   {event_url}\n" if has_distinct_checkout else ""
+        status_label = "Available (Reminder)" if alert.is_reminder else "Available"
 
         text_body = (
             f"{subject}\n\n"
-            f"Event:    {alert.event_name}\n"
-            f"Section:  {alert.section_name}\n"
-            f"Status:   Available\n"
-            f"Price:    {formatted_price}\n"
-            f"Time:     {time_str}\n"
-            f"Purchase: {alert.event_url}\n\n"
+            f"Event:        {event_name}\n"
+            f"{session_line}"
+            f"Section:      {section_name}\n"
+            f"Status:       {status_label}\n"
+            f"Price:        {formatted_price}\n"
+            f"Time:         {time_str}\n"
+            f"Purchase:     {purchase_url}\n"
+            f"{event_page_line}\n"
             f"Please visit the purchase link above immediately on AllAccess."
         )
         msg.set_content(text_body)
+
+        # HTML Body styling
+        theme_color = "#F39C12" if alert.is_reminder else "#2ECC71"
+        header_title = "Tickets Still Available!" if alert.is_reminder else "Tickets Available Detected!"
+        status_html = "🔔 Available (Reminder)" if alert.is_reminder else "🟢 Available"
+
+        session_tr = f"""<tr>
+          <td style="padding: 10px 14px; border-bottom: 1px solid #eef2f5; color: #7f8c8d; width: 35%;"><b>Date / Session:</b></td>
+          <td style="padding: 10px 14px; border-bottom: 1px solid #eef2f5; color: #2c3e50; font-weight: 600;">{html.escape(session_str)}</td>
+        </tr>""" if session_str else ""
+
+        direct_tr = f"""<tr>
+          <td style="padding: 10px 14px; border-bottom: 1px solid #eef2f5; color: #7f8c8d;"><b>Event Page:</b></td>
+          <td style="padding: 10px 14px; border-bottom: 1px solid #eef2f5; color: #2c3e50;"><a href="{html.escape(event_url, quote=True)}" style="color: #3498db; text-decoration: underline;">Landing Page</a></td>
+        </tr>""" if has_distinct_checkout else ""
 
         html_body = f"""<!DOCTYPE html>
 <html>
@@ -119,33 +163,38 @@ class EmailNotifier(BaseNotifier):
   <title>{html.escape(subject)}</title>
 </head>
 <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f7f9fa; margin: 0; padding: 20px;">
+  <div style="display:none;font-size:1px;color:#f7f9fa;line-height:1px;max-height:0px;max-width:0px;opacity:0;overflow:hidden;">
+    Tickets detected for {html.escape(section_name)} ({html.escape(formatted_price)}) - {html.escape(event_name)}
+  </div>
   <div style="max-width: 600px; margin: 0 auto; background: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.05); border: 1px solid #e1e8ed;">
-    <div style="background-color: #2ECC71; padding: 24px; text-align: center; color: #ffffff;">
-      <h1 style="margin: 0; font-size: 24px; font-weight: 700;">{html.escape(alert.event_name)}</h1>
-      <p style="margin: 6px 0 0 0; font-size: 16px; opacity: 0.95;">Tickets Available Detected!</p>
+    <div style="background-color: {theme_color}; padding: 24px; text-align: center; color: #ffffff;">
+      <h1 style="margin: 0; font-size: 24px; font-weight: 700;">{html.escape(event_name)}</h1>
+      <p style="margin: 6px 0 0 0; font-size: 16px; opacity: 0.95;">{header_title}</p>
     </div>
     <div style="padding: 28px;">
       <h2 style="color: #2c3e50; font-size: 18px; margin-top: 0;">{html.escape(subject)}</h2>
       <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
         <tr>
-          <td style="padding: 10px; border-bottom: 1px solid #eef2f5; color: #7f8c8d; width: 30%;"><b>Section:</b></td>
-          <td style="padding: 10px; border-bottom: 1px solid #eef2f5; color: #2c3e50; font-weight: 600;">{html.escape(alert.section_name)}</td>
+          <td style="padding: 10px 14px; border-bottom: 1px solid #eef2f5; color: #7f8c8d; width: 35%;"><b>Section:</b></td>
+          <td style="padding: 10px 14px; border-bottom: 1px solid #eef2f5; color: #2c3e50; font-weight: 600;">{html.escape(section_name)}</td>
+        </tr>
+        {session_tr}
+        <tr>
+          <td style="padding: 10px 14px; border-bottom: 1px solid #eef2f5; color: #7f8c8d;"><b>Status:</b></td>
+          <td style="padding: 10px 14px; border-bottom: 1px solid #eef2f5; color: #27ae60; font-weight: 600;">{status_html}</td>
         </tr>
         <tr>
-          <td style="padding: 10px; border-bottom: 1px solid #eef2f5; color: #7f8c8d;"><b>Status:</b></td>
-          <td style="padding: 10px; border-bottom: 1px solid #eef2f5; color: #27ae60; font-weight: 600;">🟢 Available</td>
+          <td style="padding: 10px 14px; border-bottom: 1px solid #eef2f5; color: #7f8c8d;"><b>Price:</b></td>
+          <td style="padding: 10px 14px; border-bottom: 1px solid #eef2f5; color: #2c3e50; font-weight: 600;">{html.escape(formatted_price)}</td>
         </tr>
         <tr>
-          <td style="padding: 10px; border-bottom: 1px solid #eef2f5; color: #7f8c8d;"><b>Price:</b></td>
-          <td style="padding: 10px; border-bottom: 1px solid #eef2f5; color: #2c3e50;">{html.escape(formatted_price)}</td>
+          <td style="padding: 10px 14px; border-bottom: 1px solid #eef2f5; color: #7f8c8d;"><b>Detected:</b></td>
+          <td style="padding: 10px 14px; border-bottom: 1px solid #eef2f5; color: #2c3e50;">{time_str}</td>
         </tr>
-        <tr>
-          <td style="padding: 10px; border-bottom: 1px solid #eef2f5; color: #7f8c8d;"><b>Detected:</b></td>
-          <td style="padding: 10px; border-bottom: 1px solid #eef2f5; color: #2c3e50;">{time_str}</td>
-        </tr>
+        {direct_tr}
       </table>
       <div style="text-align: center; margin: 32px 0;">
-        <a href="{alert.event_url}" style="background-color: #2ECC71; color: #ffffff; padding: 14px 28px; text-decoration: none; border-radius: 6px; font-weight: 700; display: inline-block; font-size: 16px;">Buy Tickets on AllAccess</a>
+        <a href="{html.escape(purchase_url, quote=True)}" style="background-color: {theme_color}; color: #ffffff; padding: 14px 28px; text-decoration: none; border-radius: 6px; font-weight: 700; display: inline-block; font-size: 16px;">Buy Tickets on AllAccess</a>
       </div>
       <p style="font-size: 12px; color: #95a5a6; text-align: center; margin-top: 24px;">
         AllAccess Ticket Monitor Daemon

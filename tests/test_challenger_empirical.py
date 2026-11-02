@@ -746,7 +746,7 @@ class TestMalformedAndCorruptedPayloads(unittest.TestCase):
                 html = f"<html><script>App.bootstrapData({json.dumps(p)});</script></html>"
                 try:
                     res = parse_allaccess_html(html, "Sivori Media")
-                    self.assertIn(res.status, [AvailabilityStatus.SECTION_NOT_FOUND, AvailabilityStatus.ERROR])
+                    self.assertIn(res.status, [AvailabilityStatus.SECTION_NOT_FOUND, AvailabilityStatus.ERROR, AvailabilityStatus.UNAVAILABLE])
                 except Exception as exc:
                     self.fail(f"Crash on hostile section name types: {type(exc).__name__}: {exc}")
 

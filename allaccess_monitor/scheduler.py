@@ -5,6 +5,7 @@ Orchestrates ticket availability checking, state evaluation, multi-channel alert
 exponential backoff, full jitter, HTTP 429 Retry-After parsing, OS signal trapping,
 sub-millisecond interruptible waiting, and telemetry metrics tracking.
 """
+from dataclasses import replace
 import email.utils
 import logging
 import math
@@ -14,10 +15,10 @@ import signal
 import sys
 import threading
 import time
-from typing import Optional, Dict, Any, Union
+from typing import Optional, Dict, Any, Union, List
 
 from allaccess_monitor.checker.base import BaseTicketChecker
-from allaccess_monitor.models import AvailabilityStatus, CheckResult, TicketAlert
+from allaccess_monitor.models import AvailabilityStatus, CheckResult, MonitoredTarget, TicketAlert
 from allaccess_monitor.notifier.base import BaseNotifier
 from allaccess_monitor.state import AlertStateManager
 
@@ -90,8 +91,8 @@ class GracefulShutdown:
 
 class PollingScheduler:
     """
-    Continuous monitoring loop orchestrating ticket checks, state evaluation,
-    multi-channel alerting, and exponential backoff resilience.
+    Continuous monitoring loop orchestrating ticket checks across multiple targets,
+    state evaluation, multi-channel alerting, and exponential backoff resilience.
     """
 
     def __init__(
@@ -104,12 +105,15 @@ class PollingScheduler:
         section_name: Optional[str] = None,
         shutdown: Optional[GracefulShutdown] = None,
         config: Optional[Any] = None,
+        targets: Optional[List[Any]] = None,
+        alert_burst_delay: float = 0.0,
         **kwargs: Any,
     ) -> None:
         self.checker = checker
         self.state_manager = state_manager or AlertStateManager()
         self.notifier = notifier
         self.config = config
+        self.alert_burst_delay = max(0.0, float(alert_burst_delay if alert_burst_delay is not None else kwargs.get("alert_burst_delay", 0.0)))
 
         # Resolve interval_seconds with kwargs aliases and config
         resolved_interval = interval_seconds
@@ -128,14 +132,52 @@ class PollingScheduler:
             resolved_max_backoff = getattr(config, "max_backoff")
         self.max_backoff = max(self.interval_seconds, float(resolved_max_backoff))
 
-        # Resolve section_name
+        # Resolve primary section_name for backward compatibility
         resolved_section = section_name or kwargs.get("target_section")
         if resolved_section is None and config is not None:
             resolved_section = getattr(config, "target_section", None)
         self.section_name = str(resolved_section or "Sivori media")
 
+        # Resolve monitored targets
+        resolved_targets = targets or kwargs.get("targets")
+        if resolved_targets is None and config is not None:
+            resolved_targets = getattr(config, "targets", None)
+
+        checker_url = getattr(checker, "event_url", None)
+        if not isinstance(checker_url, str):
+            checker_url = None
+
+        config_url = getattr(config, "event_url", None) if config else None
+        if not isinstance(config_url, str):
+            config_url = None
+
+        default_url = checker_url or config_url or "https://www.allaccess.com.ar/event/foo-fighters"
+
+        self.targets: List[MonitoredTarget] = []
+        if resolved_targets:
+            for t in resolved_targets:
+                if isinstance(t, MonitoredTarget):
+                    self.targets.append(t)
+                elif isinstance(t, dict):
+                    self.targets.append(MonitoredTarget(
+                        event_url=t.get("event_url") or t.get("url") or default_url,
+                        target_section=t.get("target_section") or t.get("section") or self.section_name,
+                        event_name=t.get("event_name") or t.get("name"),
+                        max_price=t.get("max_price"),
+                    ))
+                elif isinstance(t, str):
+                    self.targets.append(MonitoredTarget(
+                        event_url=default_url,
+                        target_section=t.strip(),
+                    ))
+                else:
+                    self.targets.append(t)
+        else:
+            self.targets = [MonitoredTarget(event_url=default_url, target_section=self.section_name)]
+
         self._shutdown = shutdown or GracefulShutdown()
         self._consecutive_errors: int = 0
+        self._last_tick_results: List[CheckResult] = []
         self._metrics: Dict[str, Any] = {
             "total_checks": 0,
             "alerts_dispatched": 0,
@@ -161,6 +203,11 @@ class PollingScheduler:
     def metrics(self) -> Dict[str, Any]:
         """Returns a snapshot copy of telemetry metrics."""
         return dict(self._metrics)
+
+    @property
+    def last_results(self) -> List[CheckResult]:
+        """List of CheckResults produced in the most recent polling cycle."""
+        return list(self._last_tick_results)
 
     def stop(self) -> None:
         """Signals graceful shutdown to terminate scheduler."""
@@ -221,62 +268,195 @@ class PollingScheduler:
         # 3. Standard successful interval
         return float(self.interval_seconds)
 
-    def run_single_tick(self) -> CheckResult:
-        """
-        Execute a single check-evaluate-notify cycle.
-        Returns the CheckResult instance. Never raises uncaught exceptions.
-        """
+    def compute_delay_for_tick(self) -> float:
+        """Compute optimal delay following a multi-target tick, honoring Retry-After across any target."""
+        if not self._last_tick_results:
+            return float(self.interval_seconds)
+        delays = [self.compute_delay_from_result(r) for r in self._last_tick_results]
+        return max(delays) if delays else float(self.interval_seconds)
+
+    def _check_single_target(self, target: MonitoredTarget) -> CheckResult:
+        """Execute check for a single target defensively."""
         try:
             if self.checker is None:
                 raise RuntimeError("No checker configured for PollingScheduler")
-            result = self.checker.check_availability(self.section_name)
+
+            target_section = getattr(target, "target_section", str(target))
+            target_url = getattr(target, "event_url", None)
+
+            checker_url = getattr(self.checker, "event_url", None)
+            url_changed = (
+                isinstance(target_url, str)
+                and isinstance(checker_url, str)
+                and target_url != checker_url
+            )
+
+            try:
+                if url_changed:
+                    self.checker.event_url = target_url
+                result = self.checker.check_availability(target_section)
+            finally:
+                if url_changed:
+                    self.checker.event_url = checker_url
+
+            # Enrich result event_name / event_url if custom target attributes provided
+            if hasattr(target, "event_name") and target.event_name and (not result.event_name or result.event_name == "Foo Fighters"):
+                result = replace(result, event_name=target.event_name)
+            if hasattr(target, "event_url") and target.event_url and not result.event_url:
+                result = replace(result, event_url=target.event_url)
+
+            return result
         except Exception as exc:
-            logger.error("Checker raised unexpected exception: %s", exc, exc_info=True)
-            result = CheckResult(
+            logger.error(
+                "Checker raised unexpected exception for target '%s': %s",
+                getattr(target, "target_section", target),
+                exc,
+                exc_info=True,
+            )
+            return CheckResult(
                 status=AvailabilityStatus.ERROR,
-                section_name=self.section_name,
+                section_name=getattr(target, "target_section", str(target)),
+                event_url=getattr(target, "event_url", ""),
                 error_message=f"Checker exception: {exc}",
                 status_code=None,
             )
 
-        self._metrics["total_checks"] += 1
-        self._metrics["last_check_status"] = result.status.value
-        self._metrics["last_check_time"] = time.time()
+    def run_single_tick(self) -> CheckResult:
+        """
+        Execute a single check-evaluate-notify cycle across all configured targets.
+        Evaluates state independently per target, dispatches alerts, and updates metrics.
+        Returns the primary CheckResult (prioritizing AVAILABLE over other statuses).
+        Never raises uncaught exceptions.
+        """
+        results: List[CheckResult] = []
+        any_error = False
+        any_success = False
 
-        if result.status == AvailabilityStatus.ERROR:
-            self._consecutive_errors += 1
-            self._metrics["failed_checks"] += 1
-            self._metrics["consecutive_errors"] = self._consecutive_errors
-            logger.warning(
-                "Check error on section '%s' (consecutive errors: %d): %s",
-                self.section_name,
-                self._consecutive_errors,
-                result.error_message,
-            )
-        else:
-            self._consecutive_errors = 0
-            self._metrics["successful_checks"] += 1
-            self._metrics["consecutive_errors"] = 0
+        # Optimized batch check if checker supports check_targets and multiple targets configured
+        if len(self.targets) > 1 and hasattr(self.checker, "check_targets") and callable(getattr(self.checker, "check_targets")):
+            try:
+                batch = self.checker.check_targets(self.targets)
+                if isinstance(batch, (list, tuple)) and all(isinstance(r, CheckResult) for r in batch):
+                    results = list(batch)
+            except Exception as exc:
+                logger.error("Checker.check_targets raised unexpected exception: %s", exc, exc_info=True)
+                results = [
+                    CheckResult(
+                        status=AvailabilityStatus.ERROR,
+                        section_name=t.target_section,
+                        event_url=t.event_url,
+                        error_message=f"Checker exception: {exc}",
+                        status_code=None,
+                    )
+                    for t in self.targets
+                ]
 
-            # State machine evaluation (only on non-error results)
+        if not results:
+            for target in self.targets:
+                res = self._check_single_target(target)
+                results.append(res)
+
+        self._last_tick_results = results
+        primary_result: Optional[CheckResult] = None
+        tick_alerts_sent = 0
+
+        for target, result in zip(self.targets, results):
+            self._metrics["total_checks"] += 1
+            self._metrics["last_check_status"] = result.status.value
+            self._metrics["last_check_time"] = time.time()
+
+            if result.status == AvailabilityStatus.ERROR:
+                any_error = True
+                self._metrics["failed_checks"] += 1
+                logger.warning(
+                    "Check error on '%s' section '%s': %s",
+                    result.event_url,
+                    target.target_section,
+                    result.error_message,
+                )
+            else:
+                any_success = True
+                self._metrics["successful_checks"] += 1
+
+            # State machine evaluation (handles transient error immunity internally)
             if self.state_manager is not None:
-                is_avail = (result.status == AvailabilityStatus.AVAILABLE)
-                decision = self.state_manager.process_check_result(is_available=is_avail)
+                try:
+                    decision = self.state_manager.process_check_result(
+                        result=result,
+                        target=target,
+                    )
+                except TypeError:
+                    try:
+                        decision = self.state_manager.process_check_result(result)
+                    except TypeError:
+                        decision = self.state_manager.process_check_result(
+                            is_available=(result.status == AvailabilityStatus.AVAILABLE)
+                        )
 
                 if decision.should_alert:
+                    # Budget limit guard
+                    effective_price = (
+                        result.section_info.total_price
+                        if (result.section_info and result.section_info.total_price is not None)
+                        else (result.section_info.price if result.section_info else None)
+                    )
+                    if target.max_price is not None and effective_price is not None:
+                        if effective_price > target.max_price:
+                            logger.info(
+                                "Tickets available for '%s' but price %.2f exceeds max_price %.2f. Suppressing alert.",
+                                target.target_section,
+                                effective_price,
+                                target.max_price,
+                            )
+                            if self.state_manager is not None and hasattr(self.state_manager, "get_target_state"):
+                                ts = self.state_manager.get_target_state(target)
+                                ts.last_alert_time = None
+                                if ts.total_alerts_sent > 0:
+                                    ts.total_alerts_sent -= 1
+                            continue
+
                     alert = result.to_alert(is_reminder=decision.is_reminder)
                     if self.notifier is not None:
+                        if self.alert_burst_delay > 0 and tick_alerts_sent > 0:
+                            self._shutdown.wait(self.alert_burst_delay)
                         try:
                             sent = self.notifier.send(alert)
                             if sent:
+                                tick_alerts_sent += 1
                                 self._metrics["alerts_dispatched"] += 1
-                                logger.info("Alert dispatched successfully for '%s'.", result.section_name)
+                                logger.info(
+                                    "Alert dispatched successfully for '%s' - '%s'.",
+                                    result.event_name,
+                                    result.section_name,
+                                )
                             else:
-                                logger.warning("Notifier returned False for alert on '%s'.", result.section_name)
+                                logger.warning(
+                                    "Notifier returned False for alert on '%s' - '%s'.",
+                                    result.event_name,
+                                    result.section_name,
+                                )
                         except Exception as exc:
                             logger.error("Notifier raised unhandled exception during send: %s", exc, exc_info=True)
 
-        return result
+            # Prioritize AVAILABLE status for primary result
+            if primary_result is None:
+                primary_result = result
+            elif primary_result.status != AvailabilityStatus.AVAILABLE and result.status == AvailabilityStatus.AVAILABLE:
+                primary_result = result
+
+        # Streak update
+        if any_error and not any_success:
+            self._consecutive_errors += 1
+        elif any_success:
+            self._consecutive_errors = 0
+        self._metrics["consecutive_errors"] = self._consecutive_errors
+
+        return primary_result if primary_result is not None else results[0]
+
+    def run_targets_tick(self) -> List[CheckResult]:
+        """Execute a single check cycle and return all target CheckResult instances."""
+        self.run_single_tick()
+        return list(self._last_tick_results)
 
     def run_once(self) -> CheckResult:
         """Alias for run_single_tick() for one-shot execution."""
@@ -292,10 +472,10 @@ class PollingScheduler:
 
         ticks = 0
         logger.info(
-            "Starting PollingScheduler (interval=%.2fs, max_backoff=%.2fs, section='%s')...",
+            "Starting PollingScheduler (interval=%.2fs, max_backoff=%.2fs, targets=%d)...",
             self.interval_seconds,
             self.max_backoff,
-            self.section_name,
+            len(self.targets),
         )
 
         try:
@@ -303,7 +483,7 @@ class PollingScheduler:
                 result = self.run_single_tick()
                 ticks += 1
 
-                delay = self.compute_delay_from_result(result)
+                delay = self.compute_delay_for_tick()
                 stopped = self._shutdown.wait(delay)
                 if stopped:
                     logger.info("Shutdown signaled during wait. Exiting loop.")

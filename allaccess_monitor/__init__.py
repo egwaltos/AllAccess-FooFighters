@@ -8,6 +8,7 @@ from allaccess_monitor.models import (
     SectionInfo,
     CheckResult,
     TicketAlert,
+    MonitoredTarget,
 )
 
 __version__ = "0.1.0"
@@ -17,4 +18,5 @@ __all__ = [
     "SectionInfo",
     "CheckResult",
     "TicketAlert",
+    "MonitoredTarget",
 ]

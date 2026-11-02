@@ -63,26 +63,62 @@ class TelegramNotifier(BaseNotifier):
             return False
 
         prefix = "🔔 [REMINDER]" if alert.is_reminder else "🚨 [ALERT]"
-        event_name_esc = html.escape(alert.event_name, quote=False)
-        section_name_esc = html.escape(alert.section_name, quote=False)
+        event_name_esc = html.escape(str(alert.event_name or "Event"), quote=False)
+        section_name_esc = html.escape(str(alert.section_name or "Sector"), quote=False)
         title = f"{prefix} {event_name_esc} - {section_name_esc} AVAILABLE!"
         status_label = "🟢 Available" if not alert.is_reminder else "🔔 Available (Reminder)"
+        if alert.status and alert.status not in ("AVAILABLE", "REMINDER"):
+            status_label = f"ℹ️ {html.escape(str(alert.status), quote=False)}"
+
         time_str = alert.timestamp.strftime("%Y-%m-%d %H:%M:%S UTC")
 
-        price_str = ""
+        session_row = ""
+        session_info = alert.session_name or alert.session_date
+        if session_info:
+            s_name = str(alert.session_name).strip() if alert.session_name else ""
+            s_date = str(alert.session_date).strip() if alert.session_date else ""
+            if s_name and s_date:
+                s_str = s_name if (s_name == s_date or s_date in s_name) else f"{s_date} ({s_name})"
+            elif s_name:
+                s_str = s_name
+            else:
+                s_str = s_date
+            session_row = f"📅 <b>Date/Session:</b> {html.escape(s_str, quote=False)}\n"
+
+        price_row = ""
         if alert.price is not None:
-            price_str = f"\n💰 <b>Price:</b> {html.escape(alert.formatted_price, quote=False)}"
+            price_row = f"💰 <b>Price:</b> {html.escape(alert.formatted_price, quote=False)}\n"
+
+        event_url = str(alert.event_url or "").strip()
+        direct_url = str(alert.direct_checkout_url or "").strip()
+        if direct_url and event_url and direct_url != event_url:
+            direct_url_esc = html.escape(direct_url, quote=True)
+            event_url_esc = html.escape(event_url, quote=True)
+            links_block = (
+                f"🛒 <a href=\"{direct_url_esc}\">Direct Purchase / Checkout Link</a>\n"
+                f"🔗 <a href=\"{event_url_esc}\">Event Page on AllAccess</a>"
+            )
+        elif direct_url and not event_url:
+            direct_url_esc = html.escape(direct_url, quote=True)
+            links_block = f"🛒 <a href=\"{direct_url_esc}\">Direct Purchase / Checkout Link</a>"
+        elif event_url:
+            event_url_esc = html.escape(event_url, quote=True)
+            links_block = f"👉 <a href=\"{event_url_esc}\">Click here to purchase on AllAccess</a>"
+        else:
+            links_block = "👉 Visit AllAccess to purchase"
 
         text = (
             f"<b>{title}</b>\n\n"
             f"📍 <b>Section:</b> {section_name_esc}\n"
-            f"🎟️ <b>Status:</b> {status_label}{price_str}\n"
+            f"{session_row}"
+            f"🎟️ <b>Status:</b> {status_label}\n"
+            f"{price_row}"
             f"🕒 <b>Time:</b> {time_str}\n\n"
-            f"👉 <a href=\"{alert.event_url}\">Click here to purchase on AllAccess</a>"
+            f"{links_block}"
         )
 
         payload = {
-            "chat_id": self.chat_id,
+            "chat_id": str(self.chat_id),
             "text": text,
             "parse_mode": self.parse_mode,
             "disable_web_page_preview": False,

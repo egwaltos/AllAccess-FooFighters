@@ -4,9 +4,12 @@ Implements cascading configuration: CLI overrides > .env / environment variables
 """
 from dataclasses import dataclass, field
 from pathlib import Path
+import json
 import os
 import re
 from typing import Optional, List, Dict, Any, Union, Tuple
+
+from allaccess_monitor.models import MonitoredTarget
 
 try:
     from dotenv import load_dotenv
@@ -72,6 +75,141 @@ def mask_secret(val: Optional[str]) -> str:
     if not val:
         return ""
     return "[REDACTED]"
+
+
+def derive_event_name_from_url(url: str) -> Optional[str]:
+    """
+    Derives a human-friendly event title from an AllAccess URL slug.
+    Example: 'https://www.allaccess.com.ar/event/foo-fighters' -> 'Foo Fighters'
+    """
+    if not url:
+        return None
+    match = re.search(r'/event/([^/?#]+)', url)
+    if match:
+        slug = match.group(1).replace("-", " ").strip()
+        return " ".join(word.capitalize() for word in slug.split())
+    return None
+
+
+def parse_targets_from_json(
+    json_content: Union[str, bytes, List[Any], Dict[str, Any]],
+    default_url: Optional[str] = None
+) -> List[MonitoredTarget]:
+    """
+    Parses JSON data into a list of validated MonitoredTarget instances.
+    Accepts raw JSON string/bytes or pre-parsed dict/list.
+    """
+    if isinstance(json_content, (str, bytes)):
+        try:
+            data = json.loads(json_content)
+        except Exception as exc:
+            raise ConfigurationError(f"Invalid JSON in events configuration: {exc}") from exc
+    else:
+        data = json_content
+
+    if data is None:
+        return []
+
+    # Unwrap dictionary wrappers: {"events": [...]} or {"targets": [...]}
+    if isinstance(data, dict):
+        if "targets" in data:
+            data = data["targets"]
+        elif "events" in data:
+            data = data["events"]
+        else:
+            # Map of {event_url: sections}
+            data = [
+                {"event_url": k, **(v if isinstance(v, dict) else {"sections": v})}
+                for k, v in data.items()
+            ]
+
+    if not isinstance(data, list):
+        raise ConfigurationError(f"Events JSON must be a list or dict with 'events'/'targets', got {type(data).__name__}")
+
+    targets: List[MonitoredTarget] = []
+    for item in data:
+        if isinstance(item, MonitoredTarget):
+            targets.append(item)
+            continue
+        if not isinstance(item, dict):
+            raise ConfigurationError(f"Target entry must be a JSON object, got {type(item).__name__}")
+
+        raw_url = item.get("event_url") or item.get("url") or default_url
+        if not raw_url:
+            raise ConfigurationError(f"Target entry missing required 'event_url': {item}")
+        event_url = str(raw_url).strip()
+        if not event_url:
+            raise ConfigurationError(f"Target entry 'event_url' cannot be empty or whitespace: {item}")
+
+        event_name = item.get("event_name") or item.get("name") or derive_event_name_from_url(event_url)
+
+        max_price_raw = item.get("max_price")
+        base_max_price = parse_float(max_price_raw, 0.0) if max_price_raw is not None else None
+        if base_max_price is not None and base_max_price <= 0:
+            raise ConfigurationError(f"Invalid max_price for '{event_url}': must be positive, got {base_max_price}")
+
+        # Extract sections: supports 'target_section', 'target_sections', 'sections', 'section'
+        raw_sections = (
+            item.get("target_section")
+            or item.get("target_sections")
+            or item.get("sections")
+            or item.get("section")
+        )
+
+        if not raw_sections or (isinstance(raw_sections, str) and not raw_sections.strip()):
+            raise ConfigurationError(f"Target entry for '{event_url}' missing target sector definition.")
+
+        section_entries: List[Tuple[str, Optional[float]]] = []
+        if isinstance(raw_sections, (list, tuple)):
+            for s in raw_sections:
+                if isinstance(s, dict):
+                    s_name = s.get("name") or s.get("section_name") or s.get("target_section")
+                    s_price_raw = s.get("max_price")
+                    s_price = parse_float(s_price_raw, 0.0) if s_price_raw is not None else base_max_price
+                    if s_price is not None and s_price <= 0:
+                        raise ConfigurationError(f"Invalid max_price for section '{s_name}': must be positive, got {s_price}")
+                    clean_name = str(s_name).strip() if s_name is not None else ""
+                    if clean_name:
+                        section_entries.append((clean_name, s_price))
+                    else:
+                        raise ConfigurationError(f"Target section name in '{event_url}' cannot be empty or whitespace.")
+                elif s is not None:
+                    clean_s = str(s).strip()
+                    if clean_s:
+                        section_entries.append((clean_s, base_max_price))
+                    else:
+                        raise ConfigurationError(f"Target section in '{event_url}' cannot be empty or whitespace.")
+        elif isinstance(raw_sections, str):
+            for s_name in parse_comma_list(raw_sections):
+                section_entries.append((s_name, base_max_price))
+
+        if not section_entries:
+            raise ConfigurationError(f"No valid target sections found for '{event_url}'.")
+
+        for sec_name, price in section_entries:
+            try:
+                targets.append(MonitoredTarget(
+                    event_url=event_url,
+                    target_section=sec_name,
+                    event_name=event_name,
+                    max_price=price,
+                ))
+            except ValueError as ve:
+                raise ConfigurationError(f"Invalid target entry: {ve}") from ve
+
+    return targets
+
+
+def parse_targets_from_file(file_path: Union[str, Path], default_url: Optional[str] = None) -> List[MonitoredTarget]:
+    """Reads and parses an events JSON configuration file."""
+    p = Path(file_path)
+    if not p.is_file():
+        raise ConfigurationError(f"Events file not found: {file_path}")
+    try:
+        content = p.read_text(encoding="utf-8")
+    except Exception as exc:
+        raise ConfigurationError(f"Could not read events file '{file_path}': {exc}") from exc
+    return parse_targets_from_json(content, default_url=default_url)
 
 
 @dataclass
@@ -209,6 +347,7 @@ class MonitorConfig:
     discord: DiscordConfig = field(default_factory=DiscordConfig)
     email: EmailConfig = field(default_factory=EmailConfig)
     poll_interval: Optional[int] = None
+    targets: List[MonitoredTarget] = field(default_factory=list)
 
     def __post_init__(self):
         if self.poll_interval is not None:
@@ -222,6 +361,46 @@ class MonitorConfig:
         self.cooldown_seconds = parse_int(self.cooldown_seconds, 1800)
         self.request_timeout_seconds = parse_float(self.request_timeout_seconds, 10.0)
         self.max_retries = parse_int(self.max_retries, 3)
+
+        # Synchronize targets list with target_section & event_url
+        if not self.targets:
+            sec_list = parse_comma_list(self.target_section)
+            if sec_list:
+                self.targets = [
+                    MonitoredTarget(
+                        event_url=self.event_url,
+                        target_section=sec,
+                        event_name=derive_event_name_from_url(self.event_url) or "Foo Fighters",
+                    )
+                    for sec in sec_list
+                ]
+            elif self.target_section and self.target_section.strip():
+                self.targets = [
+                    MonitoredTarget(
+                        event_url=self.event_url,
+                        target_section=self.target_section.strip(),
+                        event_name=derive_event_name_from_url(self.event_url) or "Foo Fighters",
+                    )
+                ]
+        else:
+            if self.targets:
+                self.event_url = self.targets[0].event_url
+                self.target_section = ", ".join(t.target_section for t in self.targets)
+
+    @property
+    def target_sections(self) -> List[str]:
+        """Returns list of unique target section names across all monitored targets."""
+        return list(dict.fromkeys(t.target_section for t in self.targets))
+
+    @property
+    def event_urls(self) -> List[str]:
+        """Returns list of unique event URLs across all monitored targets."""
+        return list(dict.fromkeys(t.event_url for t in self.targets))
+
+    @property
+    def is_multi_target(self) -> bool:
+        """Returns True if monitoring more than one (event, section) pair."""
+        return len(self.targets) > 1
 
     @property
     def has_active_notifiers(self) -> bool:
@@ -245,6 +424,19 @@ class MonitorConfig:
             errors.append(f"'event_url' must start with http:// or https://: '{self.event_url}'")
         if not self.target_section.strip():
             errors.append("'target_section' cannot be empty.")
+
+        # Target validation
+        if not self.targets:
+            errors.append("At least one monitored target must be configured.")
+        else:
+            for i, target in enumerate(self.targets):
+                if not target.event_url or not target.event_url.startswith(("http://", "https://")):
+                    errors.append(f"Target [{i}] 'event_url' must start with http:// or https://: '{target.event_url}'")
+                if not target.target_section or not target.target_section.strip():
+                    errors.append(f"Target [{i}] 'target_section' cannot be empty.")
+                if target.max_price is not None and target.max_price <= 0:
+                    errors.append(f"Target [{i}] 'max_price' must be positive, got {target.max_price}.")
+
         errors.extend(self.telegram.validate())
         errors.extend(self.discord.validate())
         errors.extend(self.email.validate())
@@ -333,6 +525,9 @@ class MonitorConfig:
             "mock_status": getter("mock_status"),
             "log_level": getter("log_level"),
             "log_file_path": _first_not_none("log_file", "log_file_path"),
+            "events_file": _first_not_none("events_file", "events"),
+            "events_json": getter("events_json"),
+            "targets": getter("targets"),
         }
 
         for k, v in mapping.items():
@@ -363,6 +558,7 @@ def load_config(
             "DISCORD_TIMEOUT_SECONDS", "EMAIL_ENABLED", "SMTP_HOST", "SMTP_PORT",
             "SMTP_USE_TLS", "SMTP_USE_SSL", "SMTP_USERNAME", "SMTP_PASSWORD",
             "EMAIL_FROM", "EMAIL_TO", "EMAIL_TIMEOUT_SECONDS",
+            "ALLACCESS_EVENTS_JSON", "ALLACCESS_EVENTS_FILE", "EVENTS_FILE",
         ):
             os.environ.pop(k, None)
 
@@ -382,9 +578,16 @@ def load_config(
 
     overrides = overrides or {}
 
-    # Target & Polling settings
-    event_url = overrides.get("event_url") or os.getenv("ALLACCESS_EVENT_URL", "https://www.allaccess.com.ar/event/foo-fighters")
-    target_section = overrides.get("target_section") or os.getenv("ALLACCESS_TARGET_SECTION", "Sivori media")
+    event_url = (
+        overrides.get("event_url")
+        or overrides.get("url")
+        or os.getenv("ALLACCESS_EVENT_URL", "https://www.allaccess.com.ar/event/foo-fighters")
+    )
+    target_section = (
+        overrides.get("target_section")
+        or overrides.get("section")
+        or os.getenv("ALLACCESS_TARGET_SECTION", "Sivori media")
+    )
 
     poll_override = overrides.get("poll_interval") if overrides.get("poll_interval") is not None else overrides.get("check_interval_seconds")
     if poll_override is not None:
@@ -509,6 +712,97 @@ def load_config(
         timeout_seconds=parse_float(overrides.get("email_timeout_seconds", os.getenv("EMAIL_TIMEOUT_SECONDS")), 15.0)
     )
 
+    # Resolve monitored targets following strict cascading precedence:
+    # Tier 1 (Highest): Explicit CLI / Runtime Overrides
+    #   1a. overrides["targets"]
+    #   1b. overrides["events_json"]
+    #   1c. overrides["events_file"]
+    #   1d. overrides["target_section"] / overrides["event_url"] (-s, -u)
+    # Tier 2 (Middle): Environment Variables (.env / os.environ)
+    #   2a. ALLACCESS_EVENTS_JSON
+    #   2b. ALLACCESS_EVENTS_FILE / EVENTS_FILE
+    #   2c. ALLACCESS_TARGET_SECTION (via target_section / __post_init__)
+    # Tier 3 (Fallback): Local Configuration File
+    #   3a. events.json (only if no section/target was specified in env or overrides)
+    # Tier 4 (Lowest): Built-in Defaults (Foo Fighters / Sivori media)
+
+    targets: Optional[List[MonitoredTarget]] = None
+
+    # Tier 1a: Explicit targets override
+    if "targets" in overrides and overrides["targets"] is not None:
+        raw_t = overrides["targets"]
+        if isinstance(raw_t, (str, bytes)):
+            targets = parse_targets_from_json(raw_t, default_url=event_url)
+        elif isinstance(raw_t, list):
+            targets = [
+                t if isinstance(t, MonitoredTarget) else MonitoredTarget.from_dict(t) if isinstance(t, dict) else t
+                for t in raw_t
+            ]
+
+    # Tier 1b: Explicit CLI events_json override
+    if targets is None and "events_json" in overrides and overrides["events_json"]:
+        targets = parse_targets_from_json(overrides["events_json"], default_url=event_url)
+
+    # Tier 1c: Explicit CLI events_file override
+    if targets is None and "events_file" in overrides and overrides["events_file"]:
+        targets = parse_targets_from_file(overrides["events_file"], default_url=event_url)
+
+    # Tier 1d: Explicit CLI single-target override (-s / --section, -u / --url)
+    # Explicit CLI flags must strictly override ambient environment variables
+    # (ALLACCESS_EVENTS_JSON, ALLACCESS_EVENTS_FILE).
+    has_sec_cli = bool(
+        (overrides.get("target_section") and str(overrides.get("target_section")).strip())
+        or (overrides.get("section") and str(overrides.get("section")).strip())
+    )
+    has_url_cli = bool(
+        (overrides.get("event_url") and str(overrides.get("event_url")).strip())
+        or (overrides.get("url") and str(overrides.get("url")).strip())
+    )
+    if targets is None and (has_sec_cli or has_url_cli):
+        sec_list = parse_comma_list(target_section)
+        if sec_list:
+            targets = [
+                MonitoredTarget(
+                    event_url=event_url,
+                    target_section=sec,
+                    event_name=derive_event_name_from_url(event_url) or "Foo Fighters",
+                )
+                for sec in sec_list
+            ]
+        elif target_section and target_section.strip():
+            targets = [
+                MonitoredTarget(
+                    event_url=event_url,
+                    target_section=target_section.strip(),
+                    event_name=derive_event_name_from_url(event_url) or "Foo Fighters",
+                )
+            ]
+
+    # Tier 2: Environment Variables (only consulted if NO CLI target overrides were supplied)
+    if targets is None:
+        env_events_json = os.getenv("ALLACCESS_EVENTS_JSON")
+        if env_events_json and env_events_json.strip():
+            targets = parse_targets_from_json(env_events_json, default_url=event_url)
+
+    if targets is None:
+        env_events_file = (
+            os.getenv("ALLACCESS_EVENTS_FILE")
+            or os.getenv("EVENTS_FILE")
+        )
+        if env_events_file and env_events_file.strip():
+            targets = parse_targets_from_file(env_events_file, default_url=event_url)
+
+    # Tier 3: Local configuration file (events.json)
+    if targets is None:
+        has_sec_env = "ALLACCESS_TARGET_SECTION" in os.environ
+        if not has_sec_cli and not has_sec_env:
+            local_events = Path("events.json")
+            if local_events.is_file():
+                try:
+                    targets = parse_targets_from_file(local_events, default_url=event_url)
+                except Exception:
+                    targets = None
+
     config = MonitorConfig(
         event_url=event_url,
         target_section=target_section,
@@ -527,6 +821,7 @@ def load_config(
         discord=discord_cfg,
         email=email_cfg,
         poll_interval=check_interval,
+        targets=targets if targets is not None else [],
     )
 
     if enforce_validation:
