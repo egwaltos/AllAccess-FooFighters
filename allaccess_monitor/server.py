@@ -66,19 +66,9 @@ class MonitorWebService:
 
         self.reservation_engine: Optional[ReservationEngine] = None
         if self.user_token:
-            cart_client = AllAccessCartClient(timeout=config.request_timeout_seconds)
-            res_cfg = ReservationEngineConfig(
-                max_hold_quantity=self.reserve_quantity,
-                user_token=self.user_token,
-                notify_on_reservation=True,
-            )
-            self.reservation_engine = ReservationEngine(
-                client=cart_client,
-                config=res_cfg,
-                notifier=self.notifier,
-            )
+            self._init_live_reservation_engine(self.user_token)
             logger.info(
-                "Auto-reserve hook ENABLED (quantity=%d, session cookie configured)",
+                "Auto-reserve hook ENABLED (quantity=%d, session token configured)",
                 self.reserve_quantity,
             )
 
@@ -97,6 +87,73 @@ class MonitorWebService:
         self.total_checks: int = 0
         self._bg_thread: Optional[threading.Thread] = None
         self.telegram_bot = TelegramCommandBot(self)
+
+    def _init_live_reservation_engine(self, raw_token: str) -> None:
+        """Initialize or update the live Crowder reservation engine with user session credentials."""
+        cart_client = AllAccessCartClient(
+            timeout=self.config.request_timeout_seconds,
+            use_crowder_checkout=True,
+        )
+        cart_client._parse_crowder_credentials(raw_token)
+        res_cfg = ReservationEngineConfig(
+            max_hold_quantity=self.reserve_quantity,
+            user_token="crowder_live_session",
+            notify_on_reservation=True,
+        )
+        self.reservation_engine = ReservationEngine(
+            client=cart_client,
+            config=res_cfg,
+            notifier=self.notifier,
+        )
+        if hasattr(self, "scheduler") and self.scheduler is not None:
+            self.scheduler.reservation_engine = self.reservation_engine
+
+    def set_user_token(self, raw_token: str) -> None:
+        """Dynamically update the AllAccess/Crowder session token at runtime."""
+        self.user_token = raw_token.strip()
+        if self.user_token:
+            self._init_live_reservation_engine(self.user_token)
+
+    def run_live_reserve(self, section_name: str = "Campo Delantero") -> dict:
+        """Execute a REAL live reservation attempt against AllAccess/Crowder for a given sector."""
+        if not self.user_token or not self.reservation_engine:
+            return {
+                "status": "no_token",
+                "error_message": "No hay token de sesión configurado (ALLACCESS_USER_TOKEN).",
+            }
+        result = self.checker.check_availability(section_name)
+        if not result.is_available:
+            return {
+                "status": "unavailable",
+                "section": section_name,
+                "ticket_status": result.status.value,
+                "error_message": f"El sector '{section_name}' figura como {result.status.value}.",
+            }
+        # Reset cooldown so manual on-demand reservation tests always execute immediately
+        self.reservation_engine._last_reservation_time = 0.0
+        target = MonitoredTarget(
+            event_url=self.config.event_url,
+            target_section=section_name,
+        )
+        reservation = self.reservation_engine.reserve_for_target(
+            target, result, quantity=self.reserve_quantity
+        )
+        if not reservation:
+            return {
+                "status": "error",
+                "error_message": "No se pudo construir la solicitud de reserva.",
+            }
+        return {
+            "status": "ok" if reservation.is_active else "error",
+            "reservation_status": reservation.status.value,
+            "section": section_name,
+            "cart_id": reservation.cart_id,
+            "checkout_url": reservation.checkout_url,
+            "hold_seconds": reservation.seconds_remaining,
+            "total_amount": reservation.total_amount,
+            "formatted_total": reservation.formatted_total,
+            "error_message": reservation.error_message,
+        }
 
     def start_background_loop(self) -> None:
         """Start the continuous background polling loop and Telegram bot listener."""
@@ -161,7 +218,7 @@ class MonitorWebService:
         mock_cart_client = AllAccessCartClient(session=mock_session)
         res_cfg = ReservationEngineConfig(
             max_hold_quantity=self.reserve_quantity,
-            user_token=self.user_token or "simulated_session_cookie",
+            user_token="simulated_session_cookie",
             notify_on_reservation=True,
         )
         test_engine = ReservationEngine(

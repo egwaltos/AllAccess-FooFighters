@@ -66,12 +66,13 @@ class TelegramCommandBot:
         commands = [
             {"command": "start", "description": "🎸 Panel interactivo principal"},
             {"command": "chequear", "description": "🔍 Chequear entradas en vivo ahora"},
-            {"command": "estado", "description": "📊 Estado del monitor y auto-reserva"},
+            {"command": "reservar", "description": "🛒 Probar reserva REAL en AllAccess"},
             {"command": "sectores", "description": "🏟️ Ver todos los sectores y precios del show"},
             {"command": "agregar", "description": "➕ Agregar sector o evento a vigilar"},
             {"command": "quitar", "description": "➖ Quitar un sector vigilado"},
-            {"command": "test", "description": "🧪 Probar alerta y reserva simulada"},
-            {"command": "ayuda", "description": "ℹ️ Guía de comandos"},
+            {"command": "token", "description": "🔑 Actualizar token crowder de sesión"},
+            {"command": "estado", "description": "📊 Estado del monitor y auto-reserva"},
+            {"command": "test", "description": "🧪 Probar alerta simulada"},
         ]
         try:
             self._session.post(
@@ -94,7 +95,10 @@ class TelegramCommandBot:
                     {"text": "➕/➖ Gestionar Sectores", "callback_data": "cmd:manage"},
                 ],
                 [
-                    {"text": "🧪 Probar Reserva Carrito", "callback_data": "cmd:test_reserve"},
+                    {"text": "🛒 Probar Reserva REAL (Campo Delantero)", "callback_data": "cmd:live_reserve"},
+                ],
+                [
+                    {"text": "🧪 Simulacro (Mock)", "callback_data": "cmd:test_reserve"},
                 ],
             ]
         }
@@ -207,7 +211,11 @@ class TelegramCommandBot:
             self._cmd_add(chat_id, arg)
         elif cmd in ("/quitar", "/remove", "/del"):
             self._cmd_remove(chat_id, arg)
-        elif cmd in ("/test", "/reservar"):
+        elif cmd in ("/reservar", "/reserve"):
+            self._cmd_live_reserve(chat_id, arg)
+        elif cmd in ("/token",):
+            self._cmd_token(chat_id, arg)
+        elif cmd in ("/test",):
             self._cmd_test_reserve(chat_id)
         else:
             self._cmd_start(chat_id)
@@ -225,6 +233,9 @@ class TelegramCommandBot:
         elif data == "cmd:manage":
             self._answer_callback(cb_id, "Gestión de sectores")
             self._cmd_manage_menu(chat_id)
+        elif data == "cmd:live_reserve":
+            self._answer_callback(cb_id, "Intentando reserva real en AllAccess...")
+            self._cmd_live_reserve(chat_id, "Campo Delantero")
         elif data == "cmd:test_reserve":
             self._answer_callback(cb_id, "Ejecutando simulacro de reserva...")
             self._cmd_test_reserve(chat_id)
@@ -255,12 +266,13 @@ class TelegramCommandBot:
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "<b>Comandos disponibles:</b>\n"
             "• /chequear — Consulta en vivo ahora mismo\n"
-            "• /estado — Estadísticas y estado de sesión\n"
+            "• /reservar <code>[sector]</code> — Probar reserva REAL en AllAccess (ej: <code>/reservar Campo Delantero</code>)\n"
             "• /sectores — Ver todos los sectores y precios del show\n"
-            "• /agregar <code>&lt;sector&gt;</code> — Sumar otro sector (ej: <code>/agregar Campo delantero</code>)\n"
-            "• /agregar <code>&lt;url&gt; | &lt;sector&gt;</code> — Sumar otro recital de AllAccess\n"
+            "• /estado — Estadísticas y estado de sesión\n"
+            "• /token — Ver o actualizar token de sesión de AllAccess\n"
+            "• /agregar <code>&lt;sector&gt;</code> — Sumar otro sector a vigilar\n"
             "• /quitar — Quitar sectores con un toque\n"
-            "• /test — Disparar prueba de reserva en carrito"
+            "• /test — Disparar simulacro de reserva (mock)"
         )
         self._send_message(chat_id, msg, reply_markup=self._main_keyboard())
 
@@ -507,3 +519,94 @@ class TelegramCommandBot:
             )
         else:
             self._send_message(chat_id, "⚠️ El simulacro devolvió un error.", reply_markup=self._main_keyboard())
+
+    def _cmd_live_reserve(self, chat_id: str, arg: str = "") -> None:
+        sec_name = arg.strip() if arg else "Campo Delantero"
+        self._send_message(
+            chat_id,
+            f"⏳ <i>Iniciando intento de reserva REAL en AllAccess para: <b>{html.escape(sec_name)}</b>...</i>\n"
+            f"Resolviendo PoW y preparando orden...",
+        )
+        res_info = self.service.run_live_reserve(section_name=sec_name)
+        status = res_info.get("status")
+
+        if status == "ok":
+            checkout_url = res_info.get("checkout_url") or "https://www.allaccess.com.ar/checkout"
+            hold_sec = res_info.get("hold_seconds") or 600
+            mins = int(hold_sec // 60)
+            formatted_tot = res_info.get("formatted_total") or f"${res_info.get('total_amount', 0):,.0f} ARS"
+            cart_id = res_info.get("cart_id") or "N/A"
+
+            msg = (
+                "🎉 <b>¡RESERVA REAL CONFIRMADA EN ALLACCESS!</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🏟️ <b>Sector:</b> {html.escape(sec_name)}\n"
+                f"🎫 <b>Cantidad:</b> {self.service.reserve_quantity} entrada(s)\n"
+                f"💰 <b>Total retenido:</b> {html.escape(formatted_tot)}\n"
+                f"⏱️ <b>Tiempo para pagar:</b> {mins} minutos restantes\n"
+                f"🆔 <b>ID de Reserva:</b> <code>{html.escape(cart_id)}</code>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"👉 <b><a href=\"{html.escape(checkout_url)}\">IR AL PAGO AHORA (LINK DIRECTO)</a></b>\n\n"
+                "⚠️ <i>Hacé clic en el enlace para ingresar tus datos de tarjeta/pago antes de que expire la reserva.</i>"
+            )
+            keyboard = {
+                "inline_keyboard": [
+                    [{"text": "💳 Pagar en AllAccess Directo", "url": checkout_url}],
+                    [{"text": "🔙 Panel Principal", "callback_data": "cmd:status"}],
+                ]
+            }
+            self._send_message(chat_id, msg, reply_markup=keyboard)
+        elif status == "no_token":
+            self._send_message(
+                chat_id,
+                "⚠️ <b>Falta configurar tu sesión de AllAccess</b>\n\n"
+                "Para poder reservar a tu nombre, el monitor necesita tu cookie o token de sesión.\n"
+                "Podés configurarlo enviando:\n"
+                "<code>/token &lt;tu_cookie_o_token&gt;</code>\n\n"
+                "O en Render en la variable de entorno <code>ALLACCESS_USER_TOKEN</code>.",
+                reply_markup=self._main_keyboard(),
+            )
+        elif status == "unavailable":
+            self._send_message(
+                chat_id,
+                f"🔴 <b>Sector no disponible:</b>\n"
+                f"El sector <b>{html.escape(sec_name)}</b> figura actualmente como <b>{res_info.get('ticket_status')}</b> en AllAccess.",
+                reply_markup=self._main_keyboard(),
+            )
+        else:
+            err = res_info.get("error_message") or "Error desconocido del servidor de AllAccess"
+            res_status = res_info.get("reservation_status") or "FAILED"
+            self._send_message(
+                chat_id,
+                f"⚠️ <b>No se pudo completar la reserva:</b>\n\n"
+                f"• Estado: <code>{html.escape(str(res_status))}</code>\n"
+                f"• Detalle: <code>{html.escape(str(err))}</code>\n\n"
+                f"💡 <i>Si el error es 401 Unauthorized, tu sesión de AllAccess puede haber expirado. Renovala con /token.</i>",
+                reply_markup=self._main_keyboard(),
+            )
+
+    def _cmd_token(self, chat_id: str, arg: str = "") -> None:
+        if not arg:
+            tok = self.service.user_token
+            masked = (tok[:12] + "..." + tok[-8:]) if len(tok) > 24 else ("Configurado" if tok else "NO configurado")
+            self._send_message(
+                chat_id,
+                f"🔑 <b>Sesión de AllAccess:</b> <code>{html.escape(masked)}</code>\n\n"
+                "Para actualizar el token de sesión sin reiniciar Render, enviá:\n"
+                "<code>/token &lt;tu_token_o_json_crowder&gt;</code>\n\n"
+                "<i>Ejemplo: pegá el valor de localStorage.crowder o la cookie connect.sid</i>",
+                reply_markup=self._main_keyboard(),
+            )
+            return
+
+        clean_token = arg.strip()
+        self.service.set_user_token(clean_token)
+        masked = (clean_token[:12] + "..." + clean_token[-8:]) if len(clean_token) > 24 else clean_token
+        self._send_message(
+            chat_id,
+            f"✅ <b>Token de sesión actualizado en memoria:</b>\n"
+            f"<code>{html.escape(masked)}</code>\n\n"
+            f"Auto-reserva lista para <b>{self.service.reserve_quantity}</b> entrada(s).\n"
+            f"Podés probarla ahora con /reservar o tocando el botón abajo.",
+            reply_markup=self._main_keyboard(),
+        )

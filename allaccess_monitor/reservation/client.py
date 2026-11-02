@@ -4,9 +4,13 @@ Strictly limited to temporary inventory holds; zero credit card or payment logic
 """
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
+import hashlib
+import json
 import logging
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple, Union
+import uuid
 
 import requests
 
@@ -113,12 +117,16 @@ class AllAccessCartClient(BaseCartClient):
         timeout_seconds: Optional[float] = None,
         connect_timeout: float = 5.0,
         user_agent: Optional[str] = None,
+        use_crowder_checkout: bool = False,
     ):
         self.base_url = base_url.rstrip("/")
         eff_timeout = timeout_seconds if timeout_seconds is not None else timeout
         self.timeout = (connect_timeout, eff_timeout)
         self._owned_session = session is None
         self.session = session or requests.Session()
+        self.use_crowder_checkout = use_crowder_checkout
+        self._cached_access_token: Optional[str] = None
+        self._cached_refresh_token: Optional[str] = None
 
         # Configure headers matching Chrome 125 on Windows standard
         ua = user_agent or DEFAULT_BROWSER_HEADERS.get(
@@ -140,23 +148,150 @@ class AllAccessCartClient(BaseCartClient):
         }
         self.session.headers.update(self.headers)
 
+    def _parse_crowder_credentials(self, raw_token: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+        """Extract (access_token, refresh_token) from LocalStorage 'crowder' JSON, pipe-delimited, or raw token."""
+        if not raw_token or raw_token == "crowder_live_session":
+            return self._cached_access_token, self._cached_refresh_token
+        tok = raw_token.strip()
+        if tok.startswith("{") and tok.endswith("}"):
+            try:
+                obj = json.loads(tok)
+                if isinstance(obj, dict):
+                    acc = obj.get("access_token") or obj.get("accessToken") or obj.get("token")
+                    ref = obj.get("refresh_token") or obj.get("refreshToken")
+                    if acc:
+                        self._cached_access_token = str(acc).strip()
+                    if ref:
+                        self._cached_refresh_token = str(ref).strip()
+                    return self._cached_access_token, self._cached_refresh_token
+            except Exception:
+                pass
+        if "|" in tok and not tok.startswith("{"):
+            parts = [p.strip() for p in tok.split("|", 1)]
+            self._cached_access_token = parts[0]
+            self._cached_refresh_token = parts[1] if len(parts) > 1 and parts[1] else self._cached_refresh_token
+            return self._cached_access_token, self._cached_refresh_token
+        if tok.lower().startswith("bearer "):
+            self._cached_access_token = tok[7:].strip()
+            return self._cached_access_token, self._cached_refresh_token
+        self._cached_access_token = tok
+        return self._cached_access_token, self._cached_refresh_token
+
+    def _solve_crowder_pow(self) -> Dict[str, str]:
+        """Fetch /api/challenge and solve SHA-256 Proof-of-Work challenge for Crowder API."""
+        ch_url = f"{self.base_url}/api/challenge"
+        resp = self.session.get(ch_url, timeout=self.timeout)
+        resp.raise_for_status()
+        ch_data = resp.json()
+        c_str = str(ch_data["challenge"])
+        effort = int(ch_data.get("effort") or 16)
+        issued_at = str(ch_data["issuedAt"])
+        otc = f"{uuid.uuid4()}anon"
+        target_zeros = "0" * effort
+
+        t0 = time.time()
+        salt = 1
+        while True:
+            digest_hex = hashlib.sha256(f"{c_str}{otc}{salt}".encode("utf-8")).hexdigest()
+            bits = bin(int(digest_hex[:8], 16))[2:].zfill(32)
+            if bits.startswith(target_zeros):
+                break
+            salt += 1
+        ms_spent = max(1, int((time.time() - t0) * 1000))
+        return {
+            "X-Client-Hostname": "www.allaccess.com.ar",
+            "X-CRW-O": otc,
+            "X-CRW-S": str(salt),
+            "X-CRW-TS": str(ms_spent),
+            "X-CRW-T": issued_at,
+            "X-CRW-E": str(effort),
+        }
+
+    def _refresh_crowder_token(self, refresh_token: str) -> Optional[str]:
+        """Refresh Crowder OAuth access_token via POST /api/oauth/access_token."""
+        try:
+            oauth_url = f"{self.base_url}/api/oauth/access_token"
+            resp = self.session.post(
+                oauth_url,
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "url": "www.allaccess.com.ar",
+                },
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "X-Client-Hostname": "www.allaccess.com.ar",
+                },
+                timeout=self.timeout,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                new_acc = data.get("access_token")
+                new_ref = data.get("refresh_token")
+                if new_acc:
+                    self._cached_access_token = str(new_acc)
+                if new_ref:
+                    self._cached_refresh_token = str(new_ref)
+                logger.info("Successfully refreshed Crowder OAuth access_token.")
+                return self._cached_access_token
+        except Exception as exc:
+            logger.warning("Failed to refresh Crowder OAuth token: %s", exc)
+        return None
+
+    def _build_crowder_order_payload(self, request: ReservationRequest) -> Dict[str, Any]:
+        """Construct the Crowder /api/shop/www.allaccess.com.ar/purchase order payload."""
+        items_list: List[Dict[str, Any]] = []
+        for _ in range(request.quantity):
+            item_entry: Dict[str, Any] = {
+                "uuid": str(uuid.uuid4()),
+                "product": request.rate_id,
+                "quantity": 1,
+            }
+            if request.sub_section_id is not None:
+                item_entry["section"] = request.sub_section_id
+            items_list.append(item_entry)
+
+        order_payload: Dict[str, Any] = {
+            "items": items_list,
+            "catalogueItems": [],
+            "event": request.event_id,
+            "channel": request.channel_id,
+            "insurance": False,
+            "link": request.event_slug or "foo-fighters",
+            "deliveryMethod": request.delivery_method or "QUENTRO",
+            "acceptOptin": False,
+        }
+        if request.passcode:
+            order_payload["passcode"] = request.passcode
+        return order_payload
+
     def reserve_tickets(self, request: ReservationRequest) -> CartReservation:
-        """Executes POST /api/cart to acquire temporary inventory hold."""
+        """Executes POST /api/cart (or Crowder /api/shop/.../purchase) to acquire temporary inventory hold."""
         # 1. Enforce strict non-transactional safety
         assert_non_transactional(request)
 
         # 2. Build URL and Payload
-        url = f"{self.base_url}/api/cart"
-        payload = request.to_api_payload()
+        if self.use_crowder_checkout:
+            url = f"{self.base_url}/api/shop/www.allaccess.com.ar/purchase"
+            payload = self._build_crowder_order_payload(request)
+        else:
+            url = f"{self.base_url}/api/cart"
+            payload = request.to_api_payload()
         assert_non_transactional(payload)
 
         # 3. Inject Request-Specific Headers / Cookies
         req_headers = dict(self.headers)
         req_headers["Origin"] = self.base_url
         req_headers["Referer"] = request.event_url or f"{self.base_url}/event/foo-fighters"
+        access_tok, refresh_tok = self._parse_crowder_credentials(request.user_token)
+
         if request.user_token:
             tok = request.user_token.strip()
-            if tok.lower().startswith("bearer "):
+            if access_tok and (self.use_crowder_checkout or tok.startswith("{") or "|" in tok):
+                req_headers["Authorization"] = f"Bearer {access_tok}"
+                self.session.cookies.set("connect.sid", access_tok)
+                self.session.cookies.set("_cid", access_tok)
+            elif tok.lower().startswith("bearer "):
                 req_headers["Authorization"] = tok
             elif tok.startswith("ey") and "." in tok and ";" not in tok and "=" not in tok:
                 req_headers["Authorization"] = f"Bearer {tok}"
@@ -167,9 +302,14 @@ class AllAccessCartClient(BaseCartClient):
                         ck_name, ck_val = part.split("=", 1)
                         self.session.cookies.set(ck_name.strip(), ck_val.strip())
             else:
-                # Raw cookie value: set both connect.sid and _cid for Crowder/AllAccess compatibility
+                # Raw cookie/token value: set both cookies and Bearer header for Crowder compatibility
                 self.session.cookies.set("connect.sid", tok)
                 self.session.cookies.set("_cid", tok)
+                if self.use_crowder_checkout:
+                    req_headers["Authorization"] = f"Bearer {tok}"
+        elif access_tok and self.use_crowder_checkout:
+            req_headers["Authorization"] = f"Bearer {access_tok}"
+
         if request.session_id:
             self.session.cookies.set("connect.sid", request.session_id)
             self.session.cookies.set("_cid", request.session_id)
@@ -178,11 +318,30 @@ class AllAccessCartClient(BaseCartClient):
 
         # 4. Dispatch HTTP Request with Fault Tolerance
         try:
+            if self.use_crowder_checkout:
+                try:
+                    pow_headers = self._solve_crowder_pow()
+                    req_headers.update(pow_headers)
+                except Exception as pow_exc:
+                    logger.warning("Crowder PoW challenge fetch failed, proceeding without PoW: %s", pow_exc)
+
             logger.info(
-                "Submitting cart reservation: show=%d, rate=%d, qty=%d",
-                request.show_id, request.rate_id, request.quantity
+                "Submitting cart reservation: show=%d, rate=%d, qty=%d (crowder=%s)",
+                request.show_id, request.rate_id, request.quantity, self.use_crowder_checkout
             )
             response = self.session.post(url, json=payload, headers=req_headers, timeout=self.timeout)
+
+            # Auto-refresh OAuth access_token on 401 if refresh_token is available
+            if response.status_code == 401 and self.use_crowder_checkout and refresh_tok:
+                new_acc = self._refresh_crowder_token(refresh_tok)
+                if new_acc:
+                    req_headers["Authorization"] = f"Bearer {new_acc}"
+                    try:
+                        req_headers.update(self._solve_crowder_pow())
+                    except Exception:
+                        pass
+                    response = self.session.post(url, json=payload, headers=req_headers, timeout=self.timeout)
+
             return self._handle_reservation_response(response, request)
         except requests.Timeout as exc:
             logger.warning("Reservation request timed out: %s", exc)
@@ -242,7 +401,13 @@ class AllAccessCartClient(BaseCartClient):
                     event_name=request.event_name,
                 )
 
-            cart_id = str(data.get("cartId") or data.get("id") or "")
+            purchase_obj = data.get("purchase") if isinstance(data.get("purchase"), dict) else {}
+            cart_id = str(
+                data.get("cartId")
+                or data.get("id")
+                or purchase_obj.get("id")
+                or ""
+            )
             expires_at_raw = data.get("expiresAt") or data.get("expiration")
             hold_expires_at = None
             if expires_at_raw:
@@ -251,7 +416,11 @@ class AllAccessCartClient(BaseCartClient):
                 except ValueError:
                     pass
 
-            hold_seconds = int(data.get("holdDurationSeconds") or data.get("holdSeconds") or 600)
+            timeout_ms = data.get("timeout") or purchase_obj.get("reservationTimeout")
+            if timeout_ms and isinstance(timeout_ms, (int, float)) and timeout_ms > 2000:
+                hold_seconds = int(timeout_ms // 1000)
+            else:
+                hold_seconds = int(data.get("holdDurationSeconds") or data.get("holdSeconds") or 600)
             if not hold_expires_at:
                 hold_expires_at = now + timedelta(seconds=hold_seconds)
 
@@ -261,10 +430,18 @@ class AllAccessCartClient(BaseCartClient):
             for item_dict in raw_items:
                 items.append(HoldItem.from_dict(item_dict))
 
-            # Fallback if Crowder returned summary without items array
+            # Fallback if Crowder returned summary or purchase object without standard items array
             if not items:
-                price = float(data.get("unitPrice") or (request.max_price or 125000.0))
-                fee = float(data.get("serviceCharge") or 0.0)
+                price = float(
+                    data.get("unitPrice")
+                    or request.unit_price
+                    or (request.max_price or 125000.0)
+                )
+                fee = float(
+                    data.get("serviceCharge")
+                    or request.service_charge
+                    or 0.0
+                )
                 subtotal = (price + fee) * request.quantity
                 items.append(HoldItem(
                     sector_name=request.sector_name or "Standard Sector",
@@ -277,11 +454,22 @@ class AllAccessCartClient(BaseCartClient):
                     sector_id=request.sector_id,
                 ))
 
-            total_amount = float(data.get("totalAmount") or data.get("totalPrice") or sum(it.subtotal for it in items))
-            currency = str(data.get("currency") or "ARS")
+            total_amount = float(
+                data.get("totalAmount")
+                or data.get("totalPrice")
+                or purchase_obj.get("totalPrice")
+                or sum(it.subtotal for it in items)
+            )
+            currency = str(data.get("currency") or purchase_obj.get("currency") or "ARS")
 
-            # Construct human checkout URL
-            checkout_url = str(data.get("checkoutUrl") or f"{self.base_url}/checkout?cart={cart_id}")
+            # Construct human checkout URL (use real /event/<slug>/pay/<purchaseId> when Crowder purchase is returned)
+            if data.get("checkoutUrl"):
+                checkout_url = str(data["checkoutUrl"])
+            elif purchase_obj.get("id") or self.use_crowder_checkout:
+                slug = request.event_slug or "foo-fighters"
+                checkout_url = f"{self.base_url}/event/{slug}/pay/{cart_id}"
+            else:
+                checkout_url = f"{self.base_url}/checkout?cart={cart_id}"
 
             logger.info("Successfully reserved cart '%s', expires in %ds", cart_id, hold_seconds)
             return CartReservation(

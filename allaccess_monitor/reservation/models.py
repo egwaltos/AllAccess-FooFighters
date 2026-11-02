@@ -198,6 +198,13 @@ class ReservationRequest:
     sector_name: str = ""
     rate_id: int = 0
     sector_id: Optional[int] = None
+    sub_section_id: Optional[int] = None
+    unit_price: Optional[float] = None
+    service_charge: Optional[float] = None
+    event_id: int = 18337
+    channel_id: int = 64233
+    event_slug: str = "foo-fighters"
+    delivery_method: str = "QUENTRO"
     quantity: int = 2
     max_price: Optional[float] = None
     max_budget_ars: Optional[float] = None
@@ -309,6 +316,19 @@ class ReservationRequest:
         sec_id_int = int(sector_id) if sector_id is not None else None
         rate_id_int = int(rate_id) if rate_id is not None else 0
 
+        # Extract sub_section_id from raw_data["sections"] if available
+        sub_sections = [s for s in raw_data.get("sections", []) if isinstance(s, dict)]
+        sub_sec_id_int: Optional[int] = None
+        for sub in sub_sections:
+            if sub.get("available") and sub.get("id") is not None:
+                sub_sec_id_int = int(sub["id"])
+                break
+        if sub_sec_id_int is None and sub_sections and sub_sections[0].get("id") is not None:
+            sub_sec_id_int = int(sub_sections[0]["id"])
+
+        u_price = float(selected_rate["price"]) if (selected_rate and selected_rate.get("price") is not None) else section_info.price
+        s_charge = float(selected_rate["serviceChargeAmount"]) if (selected_rate and selected_rate.get("serviceChargeAmount") is not None) else section_info.service_charge
+
         budget = max_budget_ars if max_budget_ars is not None else max_price
 
         return cls(
@@ -317,6 +337,9 @@ class ReservationRequest:
             sector_name=section_info.name,
             rate_id=rate_id_int,
             sector_id=sec_id_int,
+            sub_section_id=sub_sec_id_int,
+            unit_price=u_price,
+            service_charge=s_charge,
             quantity=quantity,
             max_price=budget,
             max_budget_ars=budget,
